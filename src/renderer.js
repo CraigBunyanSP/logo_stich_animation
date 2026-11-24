@@ -52,7 +52,7 @@ export const LOOKS = {
 };
 
 
-const LOGO_SIZE = 1.0;     // world units across the stitched artwork
+const LOGO_SIZE = 0.72;    // world units across the stitch-engine frame (artwork fills ~84% of it)
 const ENGINE_RES = 512;    // stitch-engine raster size
 const RHO = 0.02;          // thread radius in the unit stitch geometry
 
@@ -331,13 +331,7 @@ export class EmbroideryScene {
       fm.needsUpdate = true;
     }
 
-    const C = look.camera;
-    const caz = THREE.MathUtils.degToRad(C.azimuth), cel = THREE.MathUtils.degToRad(C.elevation);
-    this.camera.fov = C.fov;
-    this.camera.position.set(Math.sin(caz) * Math.cos(cel) * C.distance, Math.sin(cel) * C.distance, Math.cos(caz) * Math.cos(cel) * C.distance);
-    this.camera.lookAt(0, 0, 0);
-    this.camera.updateProjectionMatrix();
-    if (this.controls) { this.controls.target.set(0, 0, 0); this.controls.update(); }
+    this.#placeCamera();
 
     this.bokeh.uniforms.aperture.value = look.dof.aperture;
     this.bokeh.uniforms.maxblur.value = look.dof.maxblur;
@@ -744,10 +738,27 @@ export class EmbroideryScene {
 
   #resize() {
     const w = this.container.clientWidth, h = this.container.clientHeight;
+    if (!w || !h) return;
     this.renderer.setSize(w, h, false);
     this.composer.setSize(w, h);
+    const aspectChanged = Math.abs(this.camera.aspect - w / h) > 1e-3;
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    if (aspectChanged) this.#placeCamera();
+  }
+
+  // Look's camera angle, pulled back far enough that the artwork fits a narrow (portrait) view too.
+  #placeCamera() {
+    const C = this.look.camera;
+    const caz = THREE.MathUtils.degToRad(C.azimuth), cel = THREE.MathUtils.degToRad(C.elevation);
+    this.camera.fov = C.fov;
+    // Looks are framed for a square view; narrower views need the camera further back.
+    const halfH = Math.tan(THREE.MathUtils.degToRad(C.fov) / 2);
+    const d = C.distance * Math.max(1, halfH / (halfH * Math.min(1, this.camera.aspect)) * 0.92);
+    this.camera.position.set(Math.sin(caz) * Math.cos(cel) * d, Math.sin(cel) * d, Math.cos(caz) * Math.cos(cel) * d);
+    this.camera.lookAt(0, 0, 0);
+    this.camera.updateProjectionMatrix();
+    if (this.controls) { this.controls.target.set(0, 0, 0); this.controls.update(); }
   }
 }
 

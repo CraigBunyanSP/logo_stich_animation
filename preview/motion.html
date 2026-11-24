@@ -45,6 +45,14 @@
   .note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .loading[hidden] { display: none; }
   .loading { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; pointer-events: none; }
+  .drop {
+    position: fixed; inset: 12px; display: grid; place-items: center; pointer-events: none;
+    border: 2px dashed var(--ink); border-radius: 16px; background: color-mix(in srgb, var(--bg) 70%, transparent);
+    font: 500 15px/1.3 var(--font-ui); color: var(--ink); opacity: 0; transition: opacity .15s;
+  }
+  .drop.on { opacity: 1; }
+  .file-name { font-size: 12px; color: var(--muted); align-self: center; max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .note.error { color: #b3261e; }
   @media (max-width: 520px) { .strip { grid-template-columns: 1fr; } .lbl { margin-top: 2px; } }
 </style>
 <script type="importmap">
@@ -56,12 +64,21 @@
 
 <div id="view"></div>
 <div class="loading" id="loading">Stitching the roundel…</div>
+<div class="drop" id="drop" aria-hidden="true">Drop an SVG to stitch it</div>
 <div class="bar">
   <div class="strip">
     <span class="lbl" id="mode-lbl">Drive</span>
     <div class="group" id="modes" role="group" aria-labelledby="mode-lbl"></div>
     <span class="lbl" id="look-lbl">Look</span>
     <div class="group" id="looks" role="group" aria-labelledby="look-lbl"></div>
+    <span class="lbl" id="art-lbl">Artwork</span>
+    <div class="group" id="art" role="group" aria-labelledby="art-lbl">
+      <button type="button" data-art="sp">SP roundel</button>
+      <button type="button" data-art="multi">Multicolour test</button>
+      <button type="button" id="upload">Upload SVG…</button>
+      <span class="file-name" id="file-name"></span>
+      <input type="file" id="file" accept=".svg,image/svg+xml,image/png,image/jpeg,image/webp" hidden>
+    </div>
     <label class="lbl" for="progress">Timeline</label>
     <div class="progress"><input id="progress" type="range" min="0" max="1" step="0.001" value="0"></div>
     <div class="note" id="note"></div>
@@ -72,6 +89,7 @@
 import { EmbroideryScene, LOOKS, MOTIONS } from '../src/renderer.js';
 
 const state = { look: 'window', mode: 'play' };
+let lastCount = 0;
 const view = document.getElementById('view');
 // Spring & settle, with flourish loops. quality = sub-frames per frame for anti-aliasing and motion blur.
 const embroidery = new EmbroideryScene(view, { preset: LOOKS[state.look], motion: MOTIONS.spring, quality: +(new URLSearchParams(location.search).get('q') || 4) });
@@ -95,7 +113,9 @@ const note = document.getElementById('note');
 function sync() {
   for (const [id, key] of [['modes', 'mode'], ['looks', 'look']])
     document.getElementById(id).querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.key === state[key])));
-  note.textContent = state.mode === 'manual' ? 'Drag the timeline to scrub' : MODES[state.mode].note;
+  note.classList.remove('error');
+  const count = typeof lastCount === 'number' && lastCount ? `${lastCount.toLocaleString()} stitches · ` : '';
+  note.textContent = count + (state.mode === 'manual' ? 'Drag the timeline to scrub' : MODES[state.mode].note) + ' · drop any SVG on the page to stitch it';
 }
 buttons(document.getElementById('modes'), MODES, 'mode', k => {
   if (k === 'play') embroidery.setProgress(0);
@@ -130,10 +150,49 @@ addEventListener('pointerup', () => { dragging = false; });
 slider.addEventListener('input', () => { state.mode = 'manual'; embroidery.setProgress(+slider.value); sync(); });
 (function tick() { if (!dragging) slider.value = embroidery.progress; requestAnimationFrame(tick); })();
 
-const svg = await (await fetch('../assets/sp-roundel.svg')).text();
-window.__scene = embroidery; window.__stitchResult = await embroidery.setSVG(svg);
-embroidery.setProgress(0);
-embroidery.setMode('play');
-document.getElementById('loading').hidden = true;
-sync();
+// ---------- artwork: built-in examples, file picker, drag and drop ----------
+const loading = document.getElementById('loading'), fileName = document.getElementById('file-name');
+const ART = { sp: '../assets/sp-roundel.svg', multi: '../assets/test-multicolour.svg' };
+let artKey = 'sp', busy = false;
+function syncArt() { document.querySelectorAll('[data-art]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.art === artKey))); }
+async function stitch(input, label) {
+  if (busy) return;
+  busy = true;
+  loading.textContent = `Stitching ${label}…`; loading.hidden = false;
+  try {
+    const result = await embroidery.setSVG(input);
+    lastCount = result.count;
+    if (state.mode === 'hover') embroidery.setProgress(1); else embroidery.setProgress(0);
+    embroidery.setMode(state.mode === 'manual' ? 'play' : state.mode);
+    if (state.mode === 'manual') state.mode = 'play';
+    note.classList.remove('error');
+    sync();
+  } catch (err) {
+    note.classList.add('error');
+    note.textContent = `Couldn't stitch ${label}: ${err.message}`;
+  } finally {
+    loading.hidden = true; busy = false;
+  }
+}
+document.querySelectorAll('[data-art]').forEach(b => b.addEventListener('click', async () => {
+  artKey = b.dataset.art; fileName.textContent = ''; syncArt();
+  stitch(await (await fetch(ART[artKey])).text(), b.textContent);
+}));
+const fileInput = document.getElementById('file');
+document.getElementById('upload').addEventListener('click', () => fileInput.click());
+function useFile(file) {
+  if (!file) return;
+  artKey = 'file'; syncArt(); fileName.textContent = file.name;
+  stitch(file, file.name);
+}
+fileInput.addEventListener('change', () => { useFile(fileInput.files[0]); fileInput.value = ''; });
+const drop = document.getElementById('drop');
+let dragDepth = 0;
+addEventListener('dragenter', e => { if (e.dataTransfer?.types.includes('Files')) { dragDepth++; drop.classList.add('on'); } });
+addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; drop.classList.remove('on'); } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; drop.classList.remove('on'); useFile(e.dataTransfer.files[0]); });
+
+syncArt();
+await stitch(await (await fetch(ART.sp)).text(), 'the roundel'); window.__scene = embroidery; window.__stitchResult = true;
 </script>

@@ -260,6 +260,21 @@ export class EmbroideryScene {
     });
     el.addEventListener('pointerleave', () => { this.pointerTarget = 0; });
 
+    // Click (not drag) on the cloth: pull focus to that point. Double-click: back to the logo.
+    let down = null;
+    el.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY, t: performance.now() }; });
+    el.addEventListener('pointerup', e => {
+      if (!down || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6 || performance.now() - down.t > 450) { down = null; return; }
+      down = null;
+      const r = el.getBoundingClientRect();
+      this.raycaster.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), this.camera);
+      if (this.raycaster.ray.intersectPlane(plane, hit)) {
+        this.setFocus(hit.clone());
+        el.dispatchEvent(new CustomEvent('focuspoint', { detail: { x: e.clientX, y: e.clientY }, bubbles: true }));
+      }
+    });
+    el.addEventListener('dblclick', () => this.setFocus(null));
+
     this.applyMotion(motion);
     this.applyLook(preset);
     this.#resize();
@@ -350,6 +365,15 @@ export class EmbroideryScene {
   //   await scene.setFabricMaps({ color, normal, roughness, ao, repeat: 6 });   // URLs; any can be omitted
   // `repeat` is tiles across one world unit (the logo is ~0.6 units wide).
   // Pass null to go back to the procedural weave.
+  #origin = new THREE.Vector3();
+  #tmpV = new THREE.Vector3();
+
+  // Rack focus to a world point on the cloth (THREE.Vector3), or null to focus on the orbit target.
+  // The change eases in over about half a second, like a focus pull.
+  setFocus(point) {
+    this.focusPoint = point ? point.clone() : null;
+  }
+
   // Dye the cloth: any CSS colour, or null to go back to the look's own cloth colour.
   // The scanned maps are neutral, so the weave and highlights stay; only the dye changes.
   setFabricColour(colour) {
@@ -427,7 +451,12 @@ export class EmbroideryScene {
     u.uPointer.value.z += (this.pointerTarget - u.uPointer.value.z) * (1 - Math.exp(-dt * 5));
     this.#updateNeedle(dt);
     this.controls?.update();
-    this.bokeh.uniforms.focus.value = this.camera.position.length();
+    // Focus distance = depth along the view axis of the focus point (the orbit target by default).
+    const fp = this.focusPoint || this.controls?.target || this.#origin;
+    this.camera.updateMatrixWorld();
+    const depth = -this.#tmpV.copy(fp).applyMatrix4(this.camera.matrixWorldInverse).z;
+    this.focusDepth = this.focusDepth == null ? depth : this.focusDepth + (depth - this.focusDepth) * (1 - Math.exp(-dt * 6));
+    this.bokeh.uniforms.focus.value = this.focusDepth;
     this.composer.render();
     this.prev.T = this.T; this.prev.clock = this.clockNow;
   }

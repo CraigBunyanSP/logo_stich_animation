@@ -54,6 +54,20 @@
   .file-name { font-size: 12px; color: var(--muted); align-self: center; max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .note.error { color: #b3261e; }
   .dye { align-items: center; gap: 10px; }
+  .hide-ui {
+    position: fixed; top: calc(12px + env(safe-area-inset-top, 0px)); right: max(16px, env(safe-area-inset-right, 0px)); z-index: 2;
+    font: 500 12px/1 var(--font-ui); color: var(--ink); background: var(--panel); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; cursor: pointer; transition: opacity .2s;
+  }
+  body.clean .bar { display: none; }
+  body.clean .hide-ui { opacity: 0.25; }
+  body.clean .hide-ui:hover, body.clean .hide-ui:focus-visible { opacity: 1; }
+  .focus-ring {
+    position: fixed; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%;
+    border: 1.5px solid rgba(255,255,255,.9); box-shadow: 0 0 0 1px rgba(0,0,0,.25); pointer-events: none; opacity: 0;
+  }
+  .focus-ring.on { animation: focus-pulse .7s ease-out; }
+  @keyframes focus-pulse { 0% { opacity: 1; transform: scale(1.6); } 60% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: scale(1); } }
   .dye label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
   .dye input[type=range] { width: 92px; accent-color: #1e1f23; }
   .swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(0,0,0,.2); }
@@ -69,7 +83,9 @@
 <div id="view"></div>
 <div class="loading" id="loading">Stitching the roundel…</div>
 <div class="drop" id="drop" aria-hidden="true">Drop an SVG to stitch it</div>
-<div class="bar">
+<button type="button" class="hide-ui" id="hide-ui" aria-pressed="false" title="Hide controls (H)">Hide controls</button>
+<div class="focus-ring" id="focus-ring" aria-hidden="true"></div>
+<div class="bar" id="bar">
   <div class="strip">
     <span class="lbl" id="mode-lbl">Drive</span>
     <div class="group" id="modes" role="group" aria-labelledby="mode-lbl"></div>
@@ -130,7 +146,7 @@ function sync() {
     document.getElementById(id).querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.key === state[key])));
   note.classList.remove('error');
   const count = typeof lastCount === 'number' && lastCount ? `${lastCount.toLocaleString()} stitches · ` : '';
-  note.textContent = count + (state.mode === 'manual' ? 'Drag the timeline to scrub' : MODES[state.mode].note) + ' · drop any SVG on the page to stitch it';
+  note.textContent = count + (state.mode === 'manual' ? 'Drag the timeline to scrub' : MODES[state.mode].note) + ' · click to focus, double-click to reset · H hides controls';
 }
 buttons(document.getElementById('modes'), MODES, 'mode', k => {
   if (k === 'play') embroidery.setProgress(0);
@@ -222,6 +238,23 @@ addEventListener('dragenter', e => { if (e.dataTransfer?.types.includes('Files')
 addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; drop.classList.remove('on'); } });
 addEventListener('dragover', e => e.preventDefault());
 addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; drop.classList.remove('on'); useFile(e.dataTransfer.files[0]); });
+
+// Click to focus: show a brief ring where focus was pulled.
+const ring = document.getElementById('focus-ring');
+view.addEventListener('focuspoint', e => {
+  ring.style.left = e.detail.x + 'px'; ring.style.top = e.detail.y + 'px';
+  ring.classList.remove('on'); void ring.offsetWidth; ring.classList.add('on');
+});
+
+// Hide / show the control panel (button or H key).
+const hideBtn = document.getElementById('hide-ui');
+function setClean(on) {
+  document.body.classList.toggle('clean', on);
+  hideBtn.textContent = on ? 'Show controls' : 'Hide controls';
+  hideBtn.setAttribute('aria-pressed', String(on));
+}
+hideBtn.addEventListener('click', () => setClean(!document.body.classList.contains('clean')));
+addEventListener('keydown', e => { if ((e.key === 'h' || e.key === 'H') && !e.target.closest('input, textarea')) setClean(!document.body.classList.contains('clean')); });
 
 syncArt();
 await clothReady;

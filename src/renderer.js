@@ -309,12 +309,7 @@ export class EmbroideryScene {
     this.hemi.intensity = look.fill;
     this.scene.environmentIntensity = look.env;
 
-    this.fabricMat.color.set(look.fabric);
-    const { normal, roughness } = weaveTextures({ cells: look.weave.cells, slub: look.weave.slub });
-    for (const tex of [normal, roughness]) tex.repeat.set(look.weave.repeat, look.weave.repeat);
-    this.fabricMat.normalMap = normal;
-    this.fabricMat.roughnessMap = roughness;
-    this.fabricMat.needsUpdate = true;
+    this.#applyFabric();
 
     const m = this.threadMat;
     m.color.set(look.thread);
@@ -337,6 +332,53 @@ export class EmbroideryScene {
     this.bokeh.uniforms.maxblur.value = look.dof.maxblur;
 
     if (this.flat) { this.#updatePucker(); this.#layoutStitches(); this.#applyTimes(); }
+  }
+
+  // Use scanned / photographic maps for the cloth instead of the procedural weave.
+  //   await scene.setFabricMaps({ color, normal, roughness, ao, repeat: 6 });   // URLs; any can be omitted
+  // `repeat` is tiles across one world unit (the logo is ~0.6 units wide).
+  // Pass null to go back to the procedural weave.
+  async setFabricMaps(maps) {
+    if (!maps) { this.fabricMaps = null; this.#applyFabric(); return; }
+    const loader = new THREE.TextureLoader();
+    const load = (url, srgb) => url ? loader.loadAsync(url).then(t => {
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+      if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+      return t;
+    }) : null;
+    const [color, normal, roughness, ao] = await Promise.all([load(maps.color, true), load(maps.normal), load(maps.roughness), load(maps.ao)]);
+    this.fabricMaps = { color, normal, roughness, ao, repeat: maps.repeat ?? 6, normalScale: maps.normalScale ?? 1, tint: maps.tint ?? true };
+    this.#applyFabric();
+  }
+
+  #applyFabric() {
+    const mat = this.fabricMat, look = this.look, F = this.fabricMaps;
+    if (F) {
+      // The plane is 6 world units across.
+      const rep = F.repeat * 6;
+      for (const t of [F.color, F.normal, F.roughness, F.ao]) if (t) t.repeat.set(rep, rep);
+      mat.map = F.color || null;
+      // Keep the look's cloth colour as a tint, so both lighting looks still match their stills.
+      mat.color.set(F.tint && F.color ? '#ffffff' : look.fabric);
+      if (F.tint && F.color) mat.color.set(look.fabric).lerp(new THREE.Color('#ffffff'), 0.55);
+      mat.normalMap = F.normal || null;
+      mat.normalScale.set(F.normalScale, F.normalScale);
+      mat.roughnessMap = F.roughness || null;
+      mat.roughness = F.roughness ? 1 : 0.9;
+      mat.aoMap = F.ao || null;
+      mat.aoMapIntensity = 1;
+    } else {
+      mat.color.set(look.fabric);
+      mat.map = null; mat.aoMap = null;
+      const { normal, roughness } = weaveTextures({ cells: look.weave.cells, slub: look.weave.slub });
+      for (const tex of [normal, roughness]) tex.repeat.set(look.weave.repeat, look.weave.repeat);
+      mat.normalMap = normal;
+      mat.normalScale.set(1.5, 1.5);
+      mat.roughnessMap = roughness;
+      mat.roughness = 0.9;
+    }
+    mat.needsUpdate = true;
   }
 
   render() {

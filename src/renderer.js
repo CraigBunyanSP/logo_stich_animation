@@ -1,8 +1,9 @@
 // Embroidery renderer: draws the stitch engine's output as real 3D thread on canvas.
 //
-//   const scene = new EmbroideryScene(container, { preset: LOOKS.studio });
+//   const scene = new EmbroideryScene(container, { preset: LOOKS.window, motion: MOTIONS.spring });
 //   await scene.setSVG(svgText);
-//   scene.setProgress(1);      // 0..1 timeline (animated in step 3)
+//   scene.setMode('play');     // or 'scroll' (drive with scrubTo), 'hover', 'manual'
+//   scene.setProgress(0.5);    // jump the timeline (switches to manual)
 //
 // Each stitch is one instance of a shared arched-tube mesh, so thousands of
 // stitches render in a single draw call.
@@ -17,6 +18,9 @@ import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { VignetteShader } from 'three/addons/shaders/VignetteShader.js';
 import { svgToStitches } from './stitch-engine.js';
 import { weaveTextures, threadTwistNormal } from './textures.js';
+import { MOTIONS, stitchTimes, CLOTH_GLSL, THREAD_GLSL } from './motion.js';
+
+export { MOTIONS };
 
 export const LOOKS = {
   // A: matched to the Z1 art-direction still.
@@ -45,30 +49,67 @@ export const LOOKS = {
     weave: { cells: 16, repeat: 32, slub: 0.45 },
     pucker: 0.009,
   },
-  // C: higher, crisper, more graphic, chunkier thread.
-  graphic: {
-    name: 'C · Graphic overhead',
-    fabric: '#ebebeb', thread: '#222428', threadEnv: 0.55,
-    threadRoughness: 0.34, threadSheen: 0.8, threadClearcoat: 0.25,
-    threadRadius: 1.25, padHeight: 0.8,
-    light: { colour: '#ffffff', intensity: 3.6, azimuth: -5, elevation: 32 },
-    fill: 0.4, env: 1.0,
-    camera: { elevation: 62, azimuth: 0, distance: 1.35, fov: 32 },
-    dof: { aperture: 0.02, maxblur: 0.006 },
-    weave: { cells: 16, repeat: 48, slub: 0.1 },
-    pucker: 0.006,
-  },
 };
+
 
 const LOGO_SIZE = 1.0;     // world units across the stitched artwork
 const ENGINE_RES = 512;    // stitch-engine raster size
 const RHO = 0.02;          // thread radius in the unit stitch geometry
 
+// Add the cloth / thread motion GLSL to a built-in three.js material.
+function injectCloth(shader, uniforms) {
+  Object.assign(shader.uniforms, uniforms);
+  shader.vertexShader = CLOTH_GLSL + shader.vertexShader;
+}
+function injectThread(shader, uniforms, withNormals) {
+  Object.assign(shader.uniforms, uniforms);
+  shader.vertexShader = CLOTH_GLSL + THREAD_GLSL + shader.vertexShader;
+  if (withNormals) {
+    shader.vertexShader = shader.vertexShader.replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
+      {
+        StitchMotion smN = stitchMotion();
+        float slope = smN.lift * 3.14159 * cos(3.14159 * position.x);
+        float c = inversesqrt(1.0 + slope * slope), sn = slope * c;
+        objectNormal = vec3(c * objectNormal.x - sn * objectNormal.y, sn * objectNormal.x + c * objectNormal.y, objectNormal.z);
+      }`);
+  }
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <begin_vertex>', `#include <begin_vertex>
+      {
+        StitchMotion sm = stitchMotion();
+        transformed.x *= sm.grow;
+        float arc = sin(3.14159 * position.x);
+        transformed.y += sm.lift * arc;
+        transformed.z += sm.sway * arc;
+        transformed *= sm.visible;
+      }`)
+    .replace('#include <project_vertex>', `
+      vec4 mvPosition = vec4(transformed, 1.0);
+      #ifdef USE_INSTANCING
+        mvPosition = instanceMatrix * mvPosition;
+      #endif
+      mvPosition.y += clothOffset(mvPosition.xz);
+      mvPosition = modelViewMatrix * mvPosition;
+      gl_Position = projectionMatrix * mvPosition;`);
+}
+
 export class EmbroideryScene {
-  constructor(container, { preset = LOOKS.studio, controls = true } = {}) {
+  constructor(container, { preset = LOOKS.window, motion = MOTIONS.spring, controls = true } = {}) {
     this.container = container;
     this.look = preset;
-    this.progress = 1;
+    this.motion = motion;
+    this.mode = 'manual';
+    this.T = 1; this.target = 1;
+    this.clock = new THREE.Clock();
+    this.uniforms = {
+      uClock: { value: 0 }, uTime: { value: 1 },
+      uNeedle: { value: new THREE.Vector3(0, 0, 0) }, uPointer: { value: new THREE.Vector3(0, 0, 0) },
+      uBreath: { value: 1 }, uHover: { value: 1 },
+      uGrowDur: { value: 0.01 }, uSettleDur: { value: 0.04 }, uDamp: { value: 4 }, uFreq: { value: 2 },
+      uLoop: { value: 1 }, uSway: { value: 0.5 },
+    };
+    this.pointerTarget = 0;
+    this.needleXZ = new THREE.Vector2();
 
     const renderer = this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -116,6 +157,20 @@ export class EmbroideryScene {
       this.controls.minDistance = 0.6; this.controls.maxDistance = 3;
     }
 
+    // Pointer over the cloth: presses the fabric and loosens nearby thread.
+    this.raycaster = new THREE.Raycaster();
+    const el = renderer.domElement, plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), hit = new THREE.Vector3();
+    el.addEventListener('pointermove', e => {
+      const r = el.getBoundingClientRect();
+      this.raycaster.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), this.camera);
+      if (this.raycaster.ray.intersectPlane(plane, hit)) {
+        this.uniforms.uPointer.value.x = hit.x; this.uniforms.uPointer.value.y = hit.z;
+        this.pointerTarget = e.pointerType === 'mouse' || e.buttons === 0 ? 1 : 0;
+      }
+    });
+    el.addEventListener('pointerleave', () => { this.pointerTarget = 0; });
+
+    this.applyMotion(motion);
     this.applyLook(preset);
     this.#resize();
     new ResizeObserver(() => this.#resize()).observe(container);
@@ -129,17 +184,40 @@ export class EmbroideryScene {
     this.#layoutStitches();
     this.#updatePucker();
     this.#layoutStitches(); // again, now that stitches can sit on the puckered cloth
-    this.setProgress(this.progress);
+    this.#applyTimes();
     return this.stitches;
   }
 
-  setProgress(t) {
-    this.progress = t;
-    if (!this.flat) return;
-    // Step 2 shows the finished piece; step 3 replaces this with the loop / pull-taut motion.
-    let n = 0;
-    while (n < this.flat.length && this.flat[n].t <= t) n++;
-    this.threads.count = n;
+  // Jump straight to a point on the 0..1 timeline.
+  setProgress(t) { this.mode = 'manual'; this.T = this.target = t; this.playState = null; }
+  // Ease towards a point on the timeline (use for scroll-driven playback).
+  scrubTo(t) { this.target = Math.min(1, Math.max(0, t)); }
+  get progress() { return this.T; }
+  // World x / z of the stitch being pulled taut at timeline t.
+  needleAt(t) {
+    const order = this.tautOrder, times = this.times;
+    let lo = 0, hi = order.length - 1, idx = 0;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (times[order[mid] * 2 + 1] <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1; }
+    const b = this.flat[order[idx]].b;
+    return { x: b[0], y: b[1] };
+  }
+
+  // 'play': loops stitch, hold, unpick. 'scroll': follows scrubTo(). 'hover': finished piece reacting to the pointer.
+  setMode(mode) {
+    this.mode = mode;
+    if (mode === 'play') this.playState = { phase: 'stitch', wait: 0 };
+    if (mode === 'hover') this.target = 1;
+    if (mode === 'scroll') this.target = this.T;
+    if (this.controls) this.controls.enableZoom = this.controls.enableRotate = mode !== 'scroll';
+  }
+
+  applyMotion(motion) {
+    this.motion = motion;
+    const u = this.uniforms;
+    u.uGrowDur.value = motion.grow; u.uSettleDur.value = motion.settle;
+    u.uDamp.value = motion.damp; u.uFreq.value = motion.freq;
+    u.uLoop.value = motion.loop; u.uSway.value = motion.sway;
+    if (this.flat) this.#applyTimes();
   }
 
   applyLook(look) {
@@ -180,24 +258,98 @@ export class EmbroideryScene {
     this.bokeh.uniforms.aperture.value = look.dof.aperture;
     this.bokeh.uniforms.maxblur.value = look.dof.maxblur;
 
-    if (this.flat) { this.#updatePucker(); this.#layoutStitches(); this.setProgress(this.progress); }
+    if (this.flat) { this.#updatePucker(); this.#layoutStitches(); this.#applyTimes(); }
   }
 
   render() {
+    const dt = Math.min(this.clock.getDelta(), 0.1);
+    this.#advance(dt);
+    const u = this.uniforms;
+    u.uClock.value += dt;
+    u.uTime.value = this.T;
+    u.uPointer.value.z += (this.pointerTarget - u.uPointer.value.z) * (1 - Math.exp(-dt * 5));
+    this.#updateNeedle(dt);
     this.controls?.update();
     this.bokeh.uniforms.focus.value = this.camera.position.length();
     this.composer.render();
   }
 
+  // ---------- timeline ----------
+
+  #advance(dt) {
+    if (this.mode === 'play') {
+      const p = this.playState, dur = this.motion.duration;
+      if (p.phase === 'stitch') { this.T = Math.min(1, this.T + dt / dur); if (this.T >= 1) { p.phase = 'hold'; p.wait = 3; } }
+      else if (p.phase === 'hold') { p.wait -= dt; if (p.wait <= 0) p.phase = 'unpick'; }
+      else if (p.phase === 'unpick') { this.T = Math.max(0, this.T - dt / (dur * 0.3)); if (this.T <= 0) { p.phase = 'rest'; p.wait = 0.8; } }
+      else if (p.phase === 'rest') { p.wait -= dt; if (p.wait <= 0) p.phase = 'stitch'; }
+      this.target = this.T;
+    } else if (this.mode === 'scroll' || this.mode === 'hover') {
+      this.T += (this.target - this.T) * (1 - Math.exp(-dt * (this.mode === 'scroll' ? 5 : 1.5)));
+      if (Math.abs(this.target - this.T) < 1e-4) this.T = this.target;
+    }
+  }
+
+  // The cloth dips and ripples where the latest stitch is being pulled taut.
+  #updateNeedle(dt) {
+    const u = this.uniforms.uNeedle.value;
+    let strength = 0;
+    if (this.tautOrder && this.T > 0 && this.T < 1) {
+      const T = this.T, order = this.tautOrder, times = this.times;
+      const n = this.needleAt(T);
+      const k = 1 - Math.exp(-dt * 10);
+      this.needleXZ.x += (n.x - this.needleXZ.x) * k;
+      this.needleXZ.y += (n.y - this.needleXZ.y) * k;
+      const lastTaut = times[order[order.length - 1] * 2 + 1];
+      strength = this.motion.tug * Math.min(1, T / 0.02) * Math.min(1, Math.max(0, (lastTaut + this.motion.settle - T) / 0.03));
+    }
+    u.x = this.needleXZ.x; u.y = this.needleXZ.y;
+    u.z += (strength - u.z) * (1 - Math.exp(-dt * 6));
+  }
+
+  #applyTimes() {
+    const times = this.times = stitchTimes(this.flat, this.motion);
+    const attr = this.threads.geometry.getAttribute('aTimes');
+    if (attr && attr.array.length === times.length) { attr.array.set(times); attr.needsUpdate = true; }
+    else this.threads.geometry.setAttribute('aTimes', new THREE.InstancedBufferAttribute(times, 2));
+    this.tautOrder = Array.from(this.flat.keys()).sort((a, b) => times[a * 2 + 1] - times[b * 2 + 1]);
+    // The cloth puckers as the stitches over it are pulled taut.
+    const geo = this.fabric.geometry, reveal = geo.getAttribute('aReveal');
+    if (reveal && this.revealCell) {
+      const N = this.revealN, cell = this.revealCell, minT = new Float32Array(N * N).fill(2);
+      this.flat.forEach((s, i) => {
+        const gx = Math.round((s.b[0] / LOGO_SIZE + 0.5) * (N - 1)), gz = Math.round((s.b[1] / LOGO_SIZE + 0.5) * (N - 1));
+        if (gx >= 0 && gz >= 0 && gx < N && gz < N) minT[gz * N + gx] = Math.min(minT[gz * N + gx], times[i * 2 + 1]);
+      });
+      const grown = minFilter(minFilter(minT, N, 8), N, 8);
+      for (let i = 0; i < reveal.count; i++) {
+        const c = cell[i];
+        reveal.array[i] = c < 0 ? 0 : Math.min(1, grown[c]);
+      }
+      reveal.needsUpdate = true;
+    }
+  }
+
   // ---------- fabric ----------
 
   #buildFabric() {
-    const geo = new THREE.PlaneGeometry(6, 6, 384, 384);
+    const geo = new THREE.PlaneGeometry(6, 6, 512, 512);
     geo.rotateX(-Math.PI / 2);
+    geo.setAttribute('aPucker', new THREE.BufferAttribute(new Float32Array(geo.attributes.position.count), 1));
+    geo.setAttribute('aReveal', new THREE.BufferAttribute(new Float32Array(geo.attributes.position.count), 1));
     this.fabricMat = new THREE.MeshPhysicalMaterial({
       color: '#f3f4f6', roughness: 0.9, sheen: 0.6, sheenRoughness: 0.8, sheenColor: new THREE.Color('#ffffff'),
       normalScale: new THREE.Vector2(1.5, 1.5),
     });
+    this.fabricMat.onBeforeCompile = shader => {
+      injectCloth(shader, this.uniforms);
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aPucker;\nattribute float aReveal;')
+        .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
+          { vec2 g = clothSlope(position.xz); objectNormal = normalize(objectNormal + vec3(-g.x, 0.0, -g.y)); }`)
+        .replace('#include <begin_vertex>', `#include <begin_vertex>
+          transformed.y += clothOffset(position.xz) - aPucker * (1.0 - smoothstep(aReveal - 0.02, aReveal + 0.06, uTime));`);
+    };
     this.fabric = new THREE.Mesh(geo, this.fabricMat);
     this.fabric.receiveShadow = true;
     this.basePositions = geo.attributes.position.array.slice();
@@ -206,7 +358,7 @@ export class EmbroideryScene {
 
   // Gentle fabric undulation plus pucker around the stitched area.
   #updatePucker() {
-    const geo = this.fabric.geometry, pos = geo.attributes.position;
+    const geo = this.fabric.geometry, pos = geo.attributes.position, puckerAttr = geo.getAttribute('aPucker');
     const N = 256, cover = new Float32Array(N * N);
     // Rasterise stitch coverage into a small grid over the logo area.
     for (const s of this.flat) {
@@ -232,32 +384,32 @@ export class EmbroideryScene {
       return a;
     };
     const near = blur(cover, 3), far = blur(cover, 14);
-    const sample = (g, x, z) => {
+    const cellOf = (x, z) => {
       const gx = (x / LOGO_SIZE + 0.5) * (N - 1), gz = (z / LOGO_SIZE + 0.5) * (N - 1);
-      if (gx < 0 || gz < 0 || gx > N - 1 || gz > N - 1) return 0;
-      return g[Math.round(gz) * N + Math.round(gx)];
+      if (gx < 0 || gz < 0 || gx > N - 1 || gz > N - 1) return -1;
+      return Math.round(gz) * N + Math.round(gx);
     };
+    const sample = (g, x, z) => { const c = cellOf(x, z); return c < 0 ? 0 : g[c]; };
     const P = this.look.pucker;
+    const folds = (x, z) => (Math.sin(x * 2.1 + 0.7) * Math.sin(z * 1.7 - 0.4) * 0.012 + Math.sin(x * 4.3 - z * 3.1) * 0.003) * Math.min(1, Math.hypot(x, z) / 0.9);
+    const pucker = (x, z) => {
+      const n = sample(near, x, z), f = sample(far, x, z), r = Math.hypot(x, z);
+      // Stitched area is pulled tight and slightly raised; the cloth just outside ripples.
+      return n * P * 0.35 + (f - n) * P * Math.sin(Math.atan2(z, x) * 9 + r * 40) * 0.8;
+    };
+    this.revealN = N;
+    this.revealCell = new Int32Array(pos.count);
     for (let i = 0; i < pos.count; i++) {
       const x = this.basePositions[i * 3], z = this.basePositions[i * 3 + 2];
-      const r = Math.hypot(x, z);
-      // Broad soft folds in the cloth.
-      let y = Math.sin(x * 2.1 + 0.7) * Math.sin(z * 1.7 - 0.4) * 0.012 + Math.sin(x * 4.3 - z * 3.1) * 0.003;
-      y *= Math.min(1, r / 0.9);
-      // Stitched area is pulled tight and slightly raised; the cloth just outside ripples.
-      const n = sample(near, x, z), f = sample(far, x, z);
-      const angle = Math.atan2(z, x);
-      y += n * P * 0.35 + (f - n) * P * Math.sin(angle * 9 + r * 40) * 0.8;
-      pos.setY(i, y);
+      const pk = pucker(x, z);
+      pos.setY(i, folds(x, z) + pk);
+      puckerAttr.array[i] = pk;
+      this.revealCell[i] = cellOf(x, z);
     }
     pos.needsUpdate = true;
+    puckerAttr.needsUpdate = true;
     geo.computeVertexNormals();
-    this.heightAt = (x, z) => {
-      const r = Math.hypot(x, z);
-      let y = (Math.sin(x * 2.1 + 0.7) * Math.sin(z * 1.7 - 0.4) * 0.012 + Math.sin(x * 4.3 - z * 3.1) * 0.003) * Math.min(1, r / 0.9);
-      const n = sample(near, x, z), f = sample(far, x, z);
-      return y + n * P * 0.35 + (f - n) * P * Math.sin(Math.atan2(z, x) * 9 + r * 40) * 0.8;
-    };
+    this.heightAt = (x, z) => folds(x, z) + pucker(x, z);
   }
 
   // ---------- thread ----------
@@ -281,34 +433,50 @@ export class EmbroideryScene {
       normalMap: threadTwistNormal(), normalScale: new THREE.Vector2(0.35, 0.35),
     });
     this.threadMat.normalMap.repeat.set(1.5, 1);
-    this.threads = new THREE.InstancedMesh(geo, this.threadMat, 1);
-    this.threads.castShadow = true;
-    this.threads.receiveShadow = true;
+    this.threadMat.onBeforeCompile = shader => injectThread(shader, this.uniforms, true);
+    this.threadMat.customProgramCacheKey = () => 'stitch-thread';
+    // Shadows use the same motion so loops cast moving shadows on the cloth.
+    this.threadDepth = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+    this.threadDepth.onBeforeCompile = shader => injectThread(shader, this.uniforms, false);
+    this.threadDepth.customProgramCacheKey = () => 'stitch-thread-depth';
+    this.threads = this.#makeThreads(geo, 1);
     this.threads.count = 0;
-    this.scene.add(this.threads);
+  }
+
+  #makeThreads(geo, n) {
+    const mesh = new THREE.InstancedMesh(geo, this.threadMat, n);
+    mesh.castShadow = mesh.receiveShadow = true;
+    mesh.customDepthMaterial = this.threadDepth;
+    mesh.frustumCulled = false; // loops move outside the static bounds
+    this.scene.add(mesh);
+    return mesh;
   }
 
   #layoutStitches() {
     const flat = [];
-    for (const layer of this.stitches.layers) for (const region of layer.regions) for (const s of region.stitches) {
-      // Engine is x right / y up; world is x right / z towards camera.
-      flat.push({ a: [s.a[0] * LOGO_SIZE, -s.a[1] * LOGO_SIZE], b: [s.b[0] * LOGO_SIZE, -s.b[1] * LOGO_SIZE], t: s.t, colour: layer.colour });
+    let region = 0;
+    for (const layer of this.stitches.layers) for (const reg of layer.regions) {
+      for (const s of reg.stitches) {
+        // Engine is x right / y up; world is x right / z towards camera.
+        flat.push({ a: [s.a[0] * LOGO_SIZE, -s.a[1] * LOGO_SIZE], b: [s.b[0] * LOGO_SIZE, -s.b[1] * LOGO_SIZE], t: s.t, colour: layer.colour, region });
+      }
+      region++;
     }
     flat.sort((p, q) => p.t - q.t);
     this.flat = flat;
 
     if (this.threads.instanceMatrix.count < flat.length) {
       const old = this.threads;
-      this.threads = new THREE.InstancedMesh(old.geometry, this.threadMat, flat.length);
-      this.threads.castShadow = this.threads.receiveShadow = true;
       this.scene.remove(old);
-      this.scene.add(this.threads);
+      this.threads = this.#makeThreads(old.geometry, flat.length);
     }
+    this.threads.count = flat.length;
     // Thread radius is tied to stitch spacing so neighbouring stitches just overlap.
     const spacing = (1.15 / ENGINE_RES) * LOGO_SIZE;
     const radius = spacing * 0.85 * this.look.threadRadius;
     const m = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0);
-    const colour = new THREE.Color(), base = new THREE.Color(this.look.thread);
+    const colour = new THREE.Color();
+    const motionAttr = new Float32Array(flat.length * 4);
     let seed = 7; const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
     const multi = this.stitches.layers.length > 1;
     flat.forEach((s, i) => {
@@ -316,16 +484,21 @@ export class EmbroideryScene {
       const len = Math.hypot(dx, dz);
       q.setFromAxisAngle(up, -Math.atan2(dz, dx));
       const midY = this.heightAt ? this.heightAt((s.a[0] + s.b[0]) / 2, (s.a[1] + s.b[1]) / 2) : 0;
-      m.compose(new THREE.Vector3(s.a[0], midY + radius * 0.2, s.a[1]), q,
-        // Height follows the stitch length, so wide satin columns dome up like padded embroidery.
-        new THREE.Vector3(len, Math.max(radius * 1.8, len * 0.16 * this.look.padHeight) / RHO, radius / RHO));
+      // Height follows the stitch length, so wide satin columns dome up like padded embroidery.
+      const ySc = Math.max(radius * 1.8, len * 0.16 * this.look.padHeight) / RHO, zSc = radius / RHO;
+      m.compose(new THREE.Vector3(s.a[0], midY + radius * 0.2, s.a[1]), q, new THREE.Vector3(len, ySc, zSc));
       this.threads.setMatrixAt(i, m);
+      motionAttr.set([1 / ySc, 1 / zSc, len, rand()], i * 4);
       // Tiny per-stitch tone variation reads as real thread.
       // Single-colour artwork uses the look's thread colour; multi-colour keeps the SVG's fills.
       const tone = 1 + (rand() - 0.5) * 0.12;
       if (multi) colour.set(s.colour).multiplyScalar(tone); else colour.setRGB(tone, tone, tone);
       this.threads.setColorAt(i, colour);
     });
+    this.threads.geometry.setAttribute('aMotion', new THREE.InstancedBufferAttribute(motionAttr, 4));
+    if (!this.threads.geometry.getAttribute('aTimes') || this.threads.geometry.getAttribute('aTimes').count !== flat.length) {
+      this.threads.geometry.setAttribute('aTimes', new THREE.InstancedBufferAttribute(new Float32Array(flat.length * 2), 2));
+    }
     this.threads.instanceMatrix.needsUpdate = true;
     if (this.threads.instanceColor) this.threads.instanceColor.needsUpdate = true;
     this.threadMat.color.set(multi ? '#ffffff' : this.look.thread);
@@ -339,4 +512,16 @@ export class EmbroideryScene {
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
   }
+}
+
+// Separable min filter (radius r cells) on an N x N grid.
+function minFilter(src, N, r) {
+  const a = new Float32Array(N * N), b = new Float32Array(N * N);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    let m = Infinity; for (let k = -r; k <= r; k++) { const xx = x + k; if (xx >= 0 && xx < N) m = Math.min(m, src[y * N + xx]); } a[y * N + x] = m;
+  }
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    let m = Infinity; for (let k = -r; k <= r; k++) { const yy = y + k; if (yy >= 0 && yy < N) m = Math.min(m, a[yy * N + x]); } b[y * N + x] = m;
+  }
+  return b;
 }

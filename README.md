@@ -5,7 +5,7 @@ A code-based embroidery simulation that "stitches" any SVG logo into life in the
 ## Status
 
 1. **Stitch engine** (`src/stitch-engine.js`) – done. Turns any SVG into ordered satin / tatami stitches.
-2. WebGL look development (three options matched to the chosen art-direction still) – next.
+2. **Look development** (`src/renderer.js`, `src/textures.js`) – three WebGL looks (A Studio daylight, B Golden window, C Graphic overhead) matched against the chosen art-direction still. Thread is instanced arched tubes with anisotropic sheen; canvas is a procedural plain weave with pucker; raking light, soft shadows and depth of field.
 3. Motion and interaction (loops springing up and pulling taut, canvas pucker, scroll / hover binding).
 4. Drop-in SVG tool and embeddable web component.
 
@@ -25,8 +25,10 @@ const result = await svgToStitches(svgText);
 ## Preview
 
 ```sh
+npm install
 npm run serve
-# open http://localhost:8765/preview/engine.html  (drag the progress slider, or load another SVG)
+# http://localhost:8765/preview/engine.html  2D stitch preview (drag progress, load another SVG)
+# http://localhost:8765/preview/look.html     3D look preview (?look=studio|window|graphic)
 ```
 
 `assets/sp-roundel.svg` is the Seymourpowell roundel, traced from the brand asset preview.

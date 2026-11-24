@@ -63,26 +63,14 @@ function injectCloth(shader, uniforms) {
 }
 function injectThread(shader, uniforms, withNormals) {
   Object.assign(shader.uniforms, uniforms);
-  shader.vertexShader = CLOTH_GLSL + THREAD_GLSL + shader.vertexShader;
+  shader.vertexShader = CLOTH_GLSL + THREAD_GLSL + STITCH_VERTEX_GLSL + shader.vertexShader;
   if (withNormals) {
     shader.vertexShader = shader.vertexShader.replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
-      {
-        StitchMotion smN = stitchMotion();
-        float slope = smN.lift * 3.14159 * cos(3.14159 * position.x);
-        float c = inversesqrt(1.0 + slope * slope), sn = slope * c;
-        objectNormal = vec3(c * objectNormal.x - sn * objectNormal.y, sn * objectNormal.x + c * objectNormal.y, objectNormal.z);
-      }`);
+      vec3 stPos, stNrm; stitchVertex(stPos, stNrm);
+      objectNormal = stNrm;`);
   }
   shader.vertexShader = shader.vertexShader
-    .replace('#include <begin_vertex>', `#include <begin_vertex>
-      {
-        StitchMotion sm = stitchMotion();
-        transformed.x *= sm.grow;
-        float arc = sin(3.14159 * position.x);
-        transformed.y += sm.lift * arc;
-        transformed.z += sm.sway * arc;
-        transformed *= sm.visible;
-      }`)
+    .replace('#include <begin_vertex>', withNormals ? 'vec3 transformed = stPos;' : 'vec3 stPos, stNrm; stitchVertex(stPos, stNrm); vec3 transformed = stPos;')
     .replace('#include <project_vertex>', `
       vec4 mvPosition = vec4(transformed, 1.0);
       #ifdef USE_INSTANCING
@@ -92,6 +80,48 @@ function injectThread(shader, uniforms, withNormals) {
       mvPosition = modelViewMatrix * mvPosition;
       gl_Position = projectionMatrix * mvPosition;`);
 }
+
+// Settled stitches keep their padded, satin shape. As a stitch lifts into a loose loop it
+// turns into a round thread of constant radius, built in world-scaled space so tall loops
+// don't stretch into ribbons, then mapped back into the instance's local space.
+const STITCH_VERTEX_GLSL = /* glsl */`
+vec3 stitchCentre(float u, float len, float g, float tearW, float padY, float liftW, float swayW) {
+  float a = sin(3.14159 * u);
+  return vec3(len * u * g - tearW * sin(6.28318 * u),
+              (pow(max(a, 0.0), 0.35) - 0.55) * padY + liftW * a,
+              swayW * a);
+}
+void stitchVertex(out vec3 pOut, out vec3 nOut) {
+  StitchMotion sm = stitchMotion();
+  float u = position.x;
+  vec3 S = vec3(aMotion.z, 1.0 / aMotion.x, 1.0 / aMotion.y);   // instance scale
+  const float RHO = ${RHO.toFixed(4)};
+  float arc = sin(3.14159 * u);
+  // Padded shape, gently deformed.
+  vec3 pPad = position;
+  pPad.x = pPad.x * sm.grow - sm.tear * sin(6.28318 * u);
+  pPad.y += sm.lift * arc;
+  pPad.z += sm.sway * arc;
+  float slope = sm.lift * 3.14159 * cos(3.14159 * u);
+  float c = inversesqrt(1.0 + slope * slope), sn = slope * c;
+  vec3 nPad = vec3(c * normal.x - sn * normal.y, sn * normal.x + c * normal.y, normal.z);
+  // Round loose thread.
+  float liftW = sm.lift * S.y, swayW = sm.sway * S.z, tearW = sm.tear * S.x, padY = RHO * S.y;
+  float du = u < 0.98 ? 0.02 : -0.02;
+  vec3 c0 = stitchCentre(u, S.x, sm.grow, tearW, padY, liftW, swayW);
+  vec3 c1 = stitchCentre(u + du, S.x, sm.grow, tearW, padY, liftW, swayW);
+  vec3 T = normalize((c1 - c0) * sign(du) + vec3(1e-7, 0.0, 0.0));
+  vec3 N = normalize(cross(vec3(0.0, 0.0, 1.0), T) + vec3(0.0, 1e-6, 0.0));
+  vec3 B = cross(T, N);
+  vec3 o = position - vec3(u, (pow(max(arc, 0.0), 0.35) - 0.55) * RHO, 0.0);
+  vec2 dir = normalize(vec2(o.z, o.y) + vec2(1e-6, 0.0));
+  vec3 nW = normalize(dir.x * B + dir.y * N);
+  vec3 pW = c0 + RHO * S.z * nW;
+  float k = smoothstep(0.4, 2.0, liftW / max(padY, 1e-5));
+  pOut = mix(pPad, pW / S, k) * sm.visible;
+  nOut = normalize(mix(nPad, normalize(nW * S), k));
+}
+`;
 
 function injectFlourish(shader, uniforms, withNormals) {
   Object.assign(shader.uniforms, uniforms);

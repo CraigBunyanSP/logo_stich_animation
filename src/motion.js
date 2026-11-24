@@ -12,10 +12,12 @@ export const MOTIONS = {
   spring: {
     name: '1 · Spring & settle',
     order: 'sequence', duration: 9,
-    grow: 0.014, settle: 0.04, hold: 0,
-    loop: 0.6, damp: 4.5, freq: 2.2, sway: 0.5, tug: 1.0,
-    // Big loose loops that spring up ahead of the fill, sway, then get combed flat and pulled in.
-    flourish: {
+    grow: 0.018, settle: 0.05, hold: 0,
+    loop: 1.2, damp: 4.5, freq: 2.2, sway: 0.9, tug: 1.0,
+    // Optional: extra loose loops that spring up ahead of the fill, then get combed flat.
+    // Off for Spring & settle (Craig, 24 Nov): every loop stays on its own stitch, in stitch order.
+    flourish: null,
+    flourishLoose: {
       every: 16,                 // one loop per this many stitches
       lead: [0.05, 0.14],        // how far ahead of its stitch a loop appears (timeline units)
       height: [0.045, 0.11], width: [0.008, 0.026], sep: [0.006, 0.02],
@@ -179,7 +181,7 @@ export const THREAD_GLSL = /* glsl */`
 attribute vec4 aMotion; // 1/yScale, 1/zScale, stitch length, seed
 attribute vec2 aTimes;  // start, taut
 uniform float uGrowDur, uSettleDur, uDamp, uFreq, uLoop, uSway, uHover;
-struct StitchMotion { float grow; float lift; float sway; float visible; };
+struct StitchMotion { float grow; float lift; float sway; float tear; float visible; };
 StitchMotion stitchMotion() {
   StitchMotion m;
   float g = clamp((uTime - aTimes.x) / uGrowDur, 0.0, 1.0);
@@ -190,15 +192,20 @@ StitchMotion stitchMotion() {
   float amt = gE * spring;
   amt = amt < 0.0 ? amt * 0.3 : amt;              // overshoot pulls slightly into the cloth
   float seed = aMotion.w;
-  float H = uLoop * (0.35 * aMotion.z + 0.012);   // loop height in world units
-  float wobble = 1.0 + 0.15 * sin(uClock * 4.0 + seed * 40.0) * step(0.001, amt);
+  // Loop height varies a lot between stitches: mostly medium, some small, the odd very tall one.
+  float hvar = fract(seed * 7.13);
+  float scale = 0.5 + 1.1 * hvar * hvar + (hvar > 0.92 ? 0.8 : 0.0);
+  float H = uLoop * (0.45 * aMotion.z + 0.016) * scale;   // loop height in world units
+  float wobble = 1.0 + 0.3 * sin(uClock * 3.5 + seed * 40.0) * step(0.001, amt);
   // Pointer loosens finished thread nearby.
   vec2 ip = vec2(instanceMatrix[3].x, instanceMatrix[3].z);
   float e = distance(ip, uPointer.xy);
   float hv = uPointer.z * uHover * s * exp(-e * e / 0.0025);
   float liftW = amt * H * wobble + hv * (0.003 + 0.2 * aMotion.z) * (0.85 + 0.15 * sin(uClock * 5.0 + seed * 20.0));
-  float swayW = amt * uSway * H * sin(seed * 43.0 + uClock * 1.5 * step(0.001, amt)) + hv * 0.0015 * sin(uClock * 3.0 + seed * 10.0);
+  float swayW = amt * uSway * H * (sin(seed * 43.0) + 0.45 * sin(uClock * 2.6 + seed * 9.0) * step(0.001, amt)) + hv * 0.0015 * sin(uClock * 3.0 + seed * 10.0);
   m.grow = gE;
+  // Loose loops bulge into a teardrop, wider at the top than where the thread enters the cloth.
+  m.tear = amt * 0.22 * H / max(aMotion.z, 0.004);
   m.lift = liftW * aMotion.x;
   m.sway = swayW * aMotion.y;
   return m;

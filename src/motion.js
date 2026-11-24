@@ -13,7 +13,15 @@ export const MOTIONS = {
     name: '1 · Spring & settle',
     order: 'sequence', duration: 9,
     grow: 0.014, settle: 0.04, hold: 0,
-    loop: 1.0, damp: 4.5, freq: 2.2, sway: 0.5, tug: 1.0,
+    loop: 0.6, damp: 4.5, freq: 2.2, sway: 0.5, tug: 1.0,
+    // Big loose loops that spring up ahead of the fill, sway, then get combed flat and pulled in.
+    flourish: {
+      every: 16,                 // one loop per this many stitches
+      lead: [0.05, 0.14],        // how far ahead of its stitch a loop appears (timeline units)
+      height: [0.045, 0.11], width: [0.008, 0.026], sep: [0.006, 0.02],
+      pop: 0.025, sweep: 0.03,   // spring-up and comb-down durations
+      strays: 3, strayDelay: [0.01, 0.05], // per shape, loops that linger and whip in last
+    },
   },
   // 2: calm and continuous. Long overlapping strokes, small loops, no bounce.
   flow: {
@@ -60,6 +68,89 @@ export function stitchTimes(flat, motion) {
   }
   return times;
 }
+
+// Flourish loops: per-instance attributes for the loop shader.
+export function flourishLoops(flat, times, motion) {
+  const f = motion.flourish;
+  if (!f) return null;
+  let seed = 23; const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const lerp = ([a, b]) => a + (b - a) * rand();
+  const end = 1 - f.sweep;
+  // Last taut time of each shape, for the strays.
+  const regionEnd = new Map();
+  flat.forEach((s, i) => regionEnd.set(s.region, Math.max(regionEnd.get(s.region) || 0, times[i * 2 + 1])));
+  const picks = [];
+  for (let i = Math.floor(rand() * f.every); i < flat.length; i += Math.max(1, Math.round(f.every * (0.6 + rand() * 0.8)))) picks.push(i);
+  // The last few picks in each shape become strays.
+  const strays = new Set(), seen = new Map();
+  for (let k = picks.length - 1; k >= 0; k--) {
+    const r = flat[picks[k]].region, n = seen.get(r) || 0;
+    if (n < f.strays) { strays.add(picks[k]); seen.set(r, n + 1); }
+  }
+  const n = picks.length;
+  const base = new Float32Array(n * 4), shape = new Float32Array(n * 4), ftimes = new Float32Array(n * 3);
+  picks.forEach((i, k) => {
+    const s = flat[i];
+    const u = rand();
+    base.set([s.a[0] + (s.b[0] - s.a[0]) * u, s.a[1] + (s.b[1] - s.a[1]) * u, rand() * Math.PI * 2, lerp(f.sep)], k * 4);
+    const lean = (rand() - 0.5) * 0.9;
+    shape.set([lerp(f.height), lerp(f.width), Math.abs(lean) < 0.05 ? 0.05 : lean, rand()], k * 4);
+    const spawn = Math.max(0, times[i * 2] - lerp(f.lead));
+    let sweep = times[i * 2 + 1] + rand() * 0.01, dur = f.sweep;
+    if (strays.has(i)) { sweep = regionEnd.get(s.region) + lerp(f.strayDelay); dur = f.sweep * 0.5; }
+    ftimes.set([spawn, Math.min(sweep, end), dur], k * 3);
+  });
+  return { count: n, base, shape, times: ftimes, hosts: picks, pop: f.pop };
+}
+
+export const FLOURISH_GLSL = /* glsl */`
+attribute vec4 aBase;   // x, z, base angle, leg separation
+attribute vec4 aShape;  // height, width, lean (signed), seed
+attribute vec3 aFTimes; // spawn, sweep, sweep duration
+uniform float uPopDur, uFlourishR;
+vec3 rotY(vec3 p, float a) { float c = cos(a), s = sin(a); return vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z); }
+vec3 rotX(vec3 p, float a) { float c = cos(a), s = sin(a); return vec3(p.x, c * p.y - s * p.z, s * p.y + c * p.z); }
+struct LoopState { float pop; float lay; float pull; float visible; };
+LoopState loopState() {
+  LoopState st;
+  float g = clamp((uTime - aFTimes.x) / uPopDur, 0.0, 1.0);
+  float s = clamp((uTime - aFTimes.y) / aFTimes.z, 0.0, 1.0);
+  st.pop = 1.0 - exp(-5.0 * g) * cos(10.0 * g);
+  st.lay = smoothstep(0.0, 0.6, s);
+  st.pull = smoothstep(0.3, 1.0, s);
+  st.visible = (uTime > aFTimes.x && s < 1.0) ? 1.0 : 0.0;
+  return st;
+}
+float loopAngle(LoopState st) {
+  float seed = aShape.w;
+  float wob = 0.12 * sin(uClock * (1.3 + seed) + seed * 17.0) * (1.0 - st.lay);
+  return aShape.z + wob + sign(aShape.z) * st.lay * 1.35;
+}
+vec3 loopCurve(float u, LoopState st, float ang) {
+  float seed = aShape.w;
+  float H = aShape.x * st.pop * (1.0 - st.pull);
+  float W = aShape.y * (0.6 + 0.4 * st.pop) * (1.0 - 0.7 * st.pull);
+  float sep = aBase.w * (1.0 - 0.8 * st.pull);
+  vec3 p = vec3(sep * (u - 0.5) - W * sin(6.2832 * u), H * pow(sin(3.14159 * u), 0.7), 0.35 * W * sin(3.14159 * u) * sin(seed * 31.0));
+  p = rotX(p, ang);
+  p.y = max(p.y, uFlourishR * 1.2); // lies on the cloth rather than through it
+  p = rotY(p, aBase.z);
+  return p + vec3(aBase.x, 0.0, aBase.y);
+}
+void flourishVertex(out vec3 pos, out vec3 nrm) {
+  LoopState st = loopState();
+  float ang = loopAngle(st);
+  float u = position.x, v = position.y;
+  float du = u < 0.99 ? 0.01 : -0.01;
+  vec3 c0 = loopCurve(u, st, ang), c1 = loopCurve(u + du, st, ang);
+  vec3 T = normalize((c1 - c0) * sign(du) + vec3(1e-6, 0.0, 0.0));
+  vec3 ref = rotY(rotX(vec3(0.0, 0.0, 1.0), ang), aBase.z);
+  vec3 N = normalize(cross(T, ref) + vec3(0.0, 1e-5, 0.0));
+  vec3 B = cross(T, N);
+  nrm = cos(v) * N + sin(v) * B;
+  pos = (c0 + uFlourishR * nrm) * st.visible;
+}
+`;
 
 // Shared by the cloth and the thread so both move together:
 // a dip and ripple where the needle is working, a press under the pointer, and a slow breath.

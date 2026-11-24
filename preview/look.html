@@ -36,7 +36,7 @@ import { EmbroideryScene, LOOKS, MOTIONS } from '../src/renderer.js';
 
 const params = new URLSearchParams(location.search);
 const lookKey = params.get('look') || 'window';
-const embroidery = new EmbroideryScene(document.getElementById('view'), { preset: LOOKS[lookKey], motion: MOTIONS[params.get('motion') || 'spring'] });
+const embroidery = new EmbroideryScene(document.getElementById('view'), { preset: LOOKS[lookKey], motion: MOTIONS[params.get('motion') || 'spring'], quality: +(params.get('q') || 4) });
 window.__scene = embroidery;
 const stats = document.getElementById('stats');
 const looksEl = document.getElementById('looks');

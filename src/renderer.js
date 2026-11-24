@@ -11,14 +11,14 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { AccumulatePass } from './accumulate-pass.js';
 import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { VignetteShader } from 'three/addons/shaders/VignetteShader.js';
 import { svgToStitches } from './stitch-engine.js';
 import { weaveTextures, threadTwistNormal } from './textures.js';
-import { MOTIONS, stitchTimes, CLOTH_GLSL, THREAD_GLSL } from './motion.js';
+import { MOTIONS, stitchTimes, flourishLoops, CLOTH_GLSL, THREAD_GLSL, FLOURISH_GLSL } from './motion.js';
 
 export { MOTIONS };
 
@@ -93,8 +93,41 @@ function injectThread(shader, uniforms, withNormals) {
       gl_Position = projectionMatrix * mvPosition;`);
 }
 
+function injectFlourish(shader, uniforms, withNormals) {
+  Object.assign(shader.uniforms, uniforms);
+  shader.vertexShader = CLOTH_GLSL + FLOURISH_GLSL + shader.vertexShader;
+  if (withNormals) shader.vertexShader = shader.vertexShader.replace('#include <beginnormal_vertex>', `
+      vec3 flPos, flNrm; flourishVertex(flPos, flNrm);
+      vec3 objectNormal = flNrm;
+      #ifdef USE_TANGENT
+        vec3 objectTangent = vec3(tangent.xyz);
+      #endif`);
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <begin_vertex>', withNormals ? 'vec3 transformed = flPos;' : 'vec3 flPos, flNrm; flourishVertex(flPos, flNrm); vec3 transformed = flPos;')
+    .replace('#include <project_vertex>', `
+      vec4 mvPosition = vec4(transformed, 1.0);
+      mvPosition.y += clothOffset(mvPosition.xz);
+      mvPosition = modelViewMatrix * mvPosition;
+      gl_Position = projectionMatrix * mvPosition;`);
+}
+
+// Fine stray fibres: rest at their root until their stitch is pulled taut, then grow out.
+function injectFibres(shader, uniforms) {
+  Object.assign(shader.uniforms, uniforms);
+  shader.vertexShader = CLOTH_GLSL + 'attribute vec4 aFibre;\n' + shader.vertexShader;
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <begin_vertex>', `#include <begin_vertex>
+      { float k = smoothstep(aFibre.w, aFibre.w + 0.03, uTime); transformed = aFibre.xyz + (transformed - aFibre.xyz) * k * step(0.0, k - 0.001); }`)
+    .replace('#include <project_vertex>', `
+      vec4 mvPosition = vec4(transformed, 1.0);
+      mvPosition.y += clothOffset(mvPosition.xz);
+      mvPosition = modelViewMatrix * mvPosition;
+      gl_Position = projectionMatrix * mvPosition;`);
+}
+
 export class EmbroideryScene {
-  constructor(container, { preset = LOOKS.window, motion = MOTIONS.spring, controls = true } = {}) {
+  // quality: sub-frames per frame for anti-aliasing and motion blur (adapts down if the frame rate drops).
+  constructor(container, { preset = LOOKS.window, motion = MOTIONS.spring, controls = true, quality = 4, shutter = 0.6 } = {}) {
     this.container = container;
     this.look = preset;
     this.motion = motion;
@@ -107,7 +140,12 @@ export class EmbroideryScene {
       uBreath: { value: 1 }, uHover: { value: 1 },
       uGrowDur: { value: 0.01 }, uSettleDur: { value: 0.04 }, uDamp: { value: 4 }, uFreq: { value: 2 },
       uLoop: { value: 1 }, uSway: { value: 0.5 },
+      uPopDur: { value: 0.025 }, uFlourishR: { value: 0.0018 },
     };
+    this.shutter = shutter;
+    this.maxSamples = quality;
+    this.prev = { T: 1, clock: 0 };
+    this.frameTimes = [];
     this.pointerTarget = 0;
     this.needleXZ = new THREE.Vector2();
 
@@ -139,9 +177,19 @@ export class EmbroideryScene {
 
     this.#buildFabric();
     this.#buildThreadMesh();
+    this.#buildFlourish();
 
     this.composer = new EffectComposer(renderer);
-    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.accumulate = new AccumulatePass(this.scene, this.camera, {
+      samples: quality,
+      setSubframe: f => {
+        // f = 0 is the start of the shutter, 1 is this frame.
+        const u = this.uniforms, k = 1 - (1 - f) * this.shutter;
+        u.uTime.value = this.prev.T + (this.T - this.prev.T) * k;
+        u.uClock.value = this.prev.clock + (this.clockNow - this.prev.clock) * k;
+      },
+    });
+    this.composer.addPass(this.accumulate);
     this.bokeh = new BokehPass(this.scene, this.camera, { focus: 1.5, aperture: 0.004, maxblur: 0.01 });
     this.composer.addPass(this.bokeh);
     this.composer.addPass(new OutputPass());
@@ -189,7 +237,7 @@ export class EmbroideryScene {
   }
 
   // Jump straight to a point on the 0..1 timeline.
-  setProgress(t) { this.mode = 'manual'; this.T = this.target = t; this.playState = null; }
+  setProgress(t) { this.mode = 'manual'; this.T = this.target = this.prev.T = t; this.playState = null; }
   // Ease towards a point on the timeline (use for scroll-driven playback).
   scrubTo(t) { this.target = Math.min(1, Math.max(0, t)); }
   get progress() { return this.T; }
@@ -217,6 +265,7 @@ export class EmbroideryScene {
     u.uGrowDur.value = motion.grow; u.uSettleDur.value = motion.settle;
     u.uDamp.value = motion.damp; u.uFreq.value = motion.freq;
     u.uLoop.value = motion.loop; u.uSway.value = motion.sway;
+    u.uPopDur.value = motion.flourish?.pop ?? 0.025;
     if (this.flat) this.#applyTimes();
   }
 
@@ -246,6 +295,11 @@ export class EmbroideryScene {
     m.envMap = this.scene.environment;
     m.envMapIntensity = look.threadEnv ?? 0.25;
     m.needsUpdate = true;
+    for (const fm of [this.flourishMat]) {
+      fm.color.set(look.thread); fm.roughness = look.threadRoughness; fm.anisotropy = look.threadSheen;
+      fm.clearcoat = look.threadClearcoat; fm.envMap = this.scene.environment; fm.envMapIntensity = m.envMapIntensity;
+      fm.needsUpdate = true;
+    }
 
     const C = look.camera;
     const caz = THREE.MathUtils.degToRad(C.azimuth), cel = THREE.MathUtils.degToRad(C.elevation);
@@ -263,15 +317,28 @@ export class EmbroideryScene {
 
   render() {
     const dt = Math.min(this.clock.getDelta(), 0.1);
+    this.#adaptQuality(dt);
     this.#advance(dt);
     const u = this.uniforms;
-    u.uClock.value += dt;
+    this.clockNow = (this.clockNow || 0) + dt;
+    u.uClock.value = this.clockNow;
     u.uTime.value = this.T;
     u.uPointer.value.z += (this.pointerTarget - u.uPointer.value.z) * (1 - Math.exp(-dt * 5));
     this.#updateNeedle(dt);
     this.controls?.update();
     this.bokeh.uniforms.focus.value = this.camera.position.length();
     this.composer.render();
+    this.prev.T = this.T; this.prev.clock = this.clockNow;
+  }
+
+  // Drop sub-frames when the device can't keep up; add them back when it can.
+  #adaptQuality(dt) {
+    const f = this.frameTimes; f.push(dt);
+    if (f.length < 30) return;
+    const avg = f.reduce((a, b) => a + b, 0) / f.length; f.length = 0;
+    const a = this.accumulate;
+    if (avg > 1 / 40 && a.samples > 1) a.samples--;
+    else if (avg < 1 / 55 && a.samples < this.maxSamples) a.samples++;
   }
 
   // ---------- timeline ----------
@@ -313,6 +380,8 @@ export class EmbroideryScene {
     if (attr && attr.array.length === times.length) { attr.array.set(times); attr.needsUpdate = true; }
     else this.threads.geometry.setAttribute('aTimes', new THREE.InstancedBufferAttribute(times, 2));
     this.tautOrder = Array.from(this.flat.keys()).sort((a, b) => times[a * 2 + 1] - times[b * 2 + 1]);
+    this.#layoutFlourish();
+    this.#buildFibres();
     // The cloth puckers as the stitches over it are pulled taut.
     const geo = this.fabric.geometry, reveal = geo.getAttribute('aReveal');
     if (reveal && this.revealCell) {
@@ -477,6 +546,7 @@ export class EmbroideryScene {
     const m = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0);
     const colour = new THREE.Color();
     const motionAttr = new Float32Array(flat.length * 4);
+    this.surface = new Array(flat.length);
     let seed = 7; const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
     const multi = this.stitches.layers.length > 1;
     flat.forEach((s, i) => {
@@ -484,15 +554,23 @@ export class EmbroideryScene {
       const len = Math.hypot(dx, dz);
       q.setFromAxisAngle(up, -Math.atan2(dz, dx));
       const midY = this.heightAt ? this.heightAt((s.a[0] + s.b[0]) / 2, (s.a[1] + s.b[1]) / 2) : 0;
+      // Thread thickness varies a little from stitch to stitch, and slowly across the piece.
+      const mx = (s.a[0] + s.b[0]) / 2, mz = (s.a[1] + s.b[1]) / 2;
+      const thick = 1 + (rand() - 0.5) * 0.3 + Math.sin(mx * 23 + 1.3) * Math.sin(mz * 19 - 0.4) * 0.08;
       // Height follows the stitch length, so wide satin columns dome up like padded embroidery.
-      const ySc = Math.max(radius * 1.8, len * 0.16 * this.look.padHeight) / RHO, zSc = radius / RHO;
+      const ySc = Math.max(radius * 1.8 * thick, len * 0.16 * this.look.padHeight * (0.92 + 0.16 * rand())) / RHO, zSc = radius * thick / RHO;
       m.compose(new THREE.Vector3(s.a[0], midY + radius * 0.2, s.a[1]), q, new THREE.Vector3(len, ySc, zSc));
       this.threads.setMatrixAt(i, m);
       motionAttr.set([1 / ySc, 1 / zSc, len, rand()], i * 4);
-      // Tiny per-stitch tone variation reads as real thread.
+      // Per-stitch tone, a slow 'dye lot' drift across the piece, the odd lighter strand,
+      // and a faint warm / cool shift read as real thread.
       // Single-colour artwork uses the look's thread colour; multi-colour keeps the SVG's fills.
-      const tone = 1 + (rand() - 0.5) * 0.12;
-      if (multi) colour.set(s.colour).multiplyScalar(tone); else colour.setRGB(tone, tone, tone);
+      const lot = Math.sin(mx * 7.1 + 0.5) * Math.sin(mz * 6.3 + 2.1) * 0.12;
+      const tone = (1 + (rand() - 0.5) * 0.22 + lot) * (rand() < 0.04 ? 1.35 : 1);
+      const hue = (rand() - 0.5) * 0.08;
+      if (multi) colour.set(s.colour); else colour.setRGB(1, 1, 1);
+      colour.setRGB(colour.r * tone * (1 + hue), colour.g * tone, colour.b * tone * (1 - hue));
+      this.surface[i] = { y: midY + radius * 0.2, ySc, zSc };
       this.threads.setColorAt(i, colour);
     });
     this.threads.geometry.setAttribute('aMotion', new THREE.InstancedBufferAttribute(motionAttr, 4));
@@ -503,6 +581,135 @@ export class EmbroideryScene {
     if (this.threads.instanceColor) this.threads.instanceColor.needsUpdate = true;
     this.threadMat.color.set(multi ? '#ffffff' : this.look.thread);
     this.threadMat.needsUpdate = true; // instance colours were just added: recompile
+  }
+
+  // ---------- flourish loops ----------
+
+  #buildFlourish() {
+    // Tube grid: position.x = along the loop (0..1), position.y = angle around the thread.
+    const U = 48, V = 7, pos = [], uv = [], idx = [];
+    for (let i = 0; i <= U; i++) for (let j = 0; j <= V; j++) {
+      pos.push(i / U, (j / V) * Math.PI * 2, 0); uv.push((i / U) * 8, j / V);
+    }
+    for (let i = 0; i < U; i++) for (let j = 0; j < V; j++) {
+      const a = i * (V + 1) + j, b = a + V + 1;
+      idx.push(a, a + 1, b, b, a + 1, b + 1); // wound so the outside faces out
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(new Float32Array(pos.length), 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    geo.setIndex(idx);
+    this.flourishGeo = geo;
+    this.flourishMat = new THREE.MeshPhysicalMaterial({
+      color: '#2b2d31', roughness: 0.3, anisotropy: 0.85, clearcoat: 0.3, clearcoatRoughness: 0.2,
+      sheen: 0.12, sheenRoughness: 0.5, sheenColor: new THREE.Color('#5a5e66'),
+      normalMap: this.threadMat.normalMap, normalScale: new THREE.Vector2(0.35, 0.35),
+    });
+    this.flourishMat.onBeforeCompile = shader => injectFlourish(shader, this.uniforms, true);
+    this.flourishMat.customProgramCacheKey = () => 'stitch-flourish';
+    this.flourishDepth = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+    this.flourishDepth.onBeforeCompile = shader => injectFlourish(shader, this.uniforms, false);
+    this.flourishDepth.customProgramCacheKey = () => 'stitch-flourish-depth';
+  }
+
+  #layoutFlourish() {
+    if (this.flourish) { this.scene.remove(this.flourish); this.flourish.dispose(); this.flourish = null; }
+    const loops = flourishLoops(this.flat, this.times, this.motion);
+    if (!loops || !loops.count) return;
+    const geo = this.flourishGeo.clone();
+    geo.setAttribute('aBase', new THREE.InstancedBufferAttribute(loops.base, 4));
+    geo.setAttribute('aShape', new THREE.InstancedBufferAttribute(loops.shape, 4));
+    geo.setAttribute('aFTimes', new THREE.InstancedBufferAttribute(loops.times, 3));
+    const mesh = this.flourish = new THREE.InstancedMesh(geo, this.flourishMat, loops.count);
+    const multi = this.stitches.layers.length > 1, c = new THREE.Color();
+    loops.hosts.forEach((h, k) => { if (multi) c.set(this.flat[h].colour); else c.setRGB(1, 1, 1); mesh.setColorAt(k, c); });
+    mesh.castShadow = true; mesh.receiveShadow = true;
+    mesh.customDepthMaterial = this.flourishDepth;
+    mesh.frustumCulled = false;
+    this.flourishMat.color.set(multi ? '#ffffff' : this.look.thread);
+    this.uniforms.uFlourishR.value = (1.15 / ENGINE_RES) * LOGO_SIZE * 1.5 * this.look.threadRadius; // a loose loop is a whole plied thread
+    this.scene.add(mesh);
+  }
+
+  // ---------- stray fibres ----------
+
+  // Thousands of tiny curled fibres: some lifting off the thread, a few lying loose on the cloth.
+  #buildFibres() {
+    if (this.fibres) { this.scene.remove(this.fibres); this.fibres.geometry.dispose(); this.fibres = null; }
+    const flat = this.flat, times = this.times, settle = this.motion.settle;
+    let seed = 101; const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    const SEG = 5, RAD = 3;
+    const pos = [], nrm = [], col = [], fib = [], idx = [];
+    const thread = new THREE.Color(this.look.thread), fabric = new THREE.Color(this.look.fabric);
+    const multi = this.stitches.layers.length > 1, c = new THREE.Color();
+    const addFibre = (root, dir, len, r, curl, colour, reveal) => {
+      const base = pos.length / 3;
+      // Side vectors for the curl and the tube.
+      const side = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0, 1, 0));
+      if (side.lengthSq() < 1e-6) side.set(1, 0, 0);
+      side.normalize();
+      const pts = [];
+      for (let i = 0; i <= SEG; i++) {
+        const u = i / SEG;
+        pts.push(root.clone().addScaledVector(dir, len * u).addScaledVector(side, curl * len * u * u)
+          .add(new THREE.Vector3(0, -0.25 * len * u * u * Math.abs(dir.y < 0.3 ? 0 : 1), 0)));
+      }
+      for (let i = 0; i <= SEG; i++) {
+        const t = (i < SEG ? pts[i + 1].clone().sub(pts[i]) : pts[i].clone().sub(pts[i - 1])).normalize();
+        const n1 = new THREE.Vector3().crossVectors(t, side).normalize(), n2 = new THREE.Vector3().crossVectors(t, n1);
+        const rr = r * (1 - 0.7 * i / SEG);
+        for (let j = 0; j < RAD; j++) {
+          const a = (j / RAD) * Math.PI * 2, n = n1.clone().multiplyScalar(Math.cos(a)).addScaledVector(n2, Math.sin(a));
+          pos.push(...pts[i].clone().addScaledVector(n, rr).toArray()); nrm.push(...n.toArray());
+          col.push(colour.r, colour.g, colour.b); fib.push(root.x, root.y, root.z, reveal);
+        }
+      }
+      for (let i = 0; i < SEG; i++) for (let j = 0; j < RAD; j++) {
+        const a = base + i * RAD + j, b = base + i * RAD + (j + 1) % RAD, c2 = a + RAD, d = b + RAD;
+        idx.push(a, c2, b, b, c2, d);
+      }
+    };
+    // Fibres on the thread.
+    const count = Math.min(6000, flat.length * 2);
+    const r0 = (1.15 / ENGINE_RES) * LOGO_SIZE * 0.85 * this.look.threadRadius;
+    for (let k = 0; k < count; k++) {
+      const i = Math.floor(rand() * flat.length), s = flat[i], sf = this.surface[i];
+      const u = 0.1 + rand() * 0.8, phi = (0.15 + rand() * 0.7) * Math.PI;
+      const dx = s.b[0] - s.a[0], dz = s.b[1] - s.a[1], len = Math.hypot(dx, dz) || 1;
+      const across = new THREE.Vector3(-dz / len, 0, dx / len);
+      const archY = (Math.pow(Math.sin(Math.PI * u), 0.35) - 0.55) * RHO * sf.ySc;
+      const root = new THREE.Vector3(s.a[0] + dx * u, sf.y + archY + Math.sin(phi) * RHO * sf.ySc * 0.9, s.a[1] + dz * u)
+        .addScaledVector(across, Math.cos(phi) * RHO * sf.zSc);
+      const dir = across.clone().multiplyScalar(Math.cos(phi) * 1.4).add(new THREE.Vector3(dx / len * (rand() - 0.5), 0.5 + rand() * 0.6, dz / len * (rand() - 0.5))).normalize();
+      if (multi) c.set(s.colour); else c.copy(thread);
+      c.multiplyScalar(1.15 + rand() * 0.35);
+      addFibre(root, dir, r0 * (1.5 + rand() * 4.5), r0 * (0.06 + rand() * 0.06), (rand() - 0.5) * 1.6, c, times[i * 2 + 1] + settle * 0.6);
+    }
+    // A few loose fibres lying on the cloth around the piece.
+    for (let k = 0; k < 500; k++) {
+      const a = rand() * Math.PI * 2, rr = 0.15 + Math.sqrt(rand()) * 0.75;
+      const x = Math.cos(a) * rr, z = Math.sin(a) * rr;
+      const root = new THREE.Vector3(x, (this.heightAt ? this.heightAt(x, z) : 0) + r0 * 0.15, z);
+      const b = rand() * Math.PI * 2, dir = new THREE.Vector3(Math.cos(b), 0.05 + rand() * 0.15, Math.sin(b)).normalize();
+      c.copy(fabric).multiplyScalar(0.92 + rand() * 0.14);
+      addFibre(root, dir, r0 * (3 + rand() * 10), r0 * (0.08 + rand() * 0.06), (rand() - 0.5) * 2.5, c, -1);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    geo.setAttribute('aFibre', new THREE.Float32BufferAttribute(fib, 4));
+    geo.setIndex(idx);
+    if (!this.fibreMat) {
+      this.fibreMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.55, envMapIntensity: 0.4 });
+      this.fibreMat.onBeforeCompile = shader => injectFibres(shader, this.uniforms);
+      this.fibreMat.customProgramCacheKey = () => 'stitch-fibres';
+    }
+    this.fibres = new THREE.Mesh(geo, this.fibreMat);
+    this.fibres.frustumCulled = false;
+    this.fibres.receiveShadow = true;
+    this.scene.add(this.fibres);
   }
 
   #resize() {

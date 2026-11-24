@@ -1,5 +1,5 @@
 <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Stitched Roundel Motion</title>
+<title>Stitched Roundel</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <style>
   /* Layout: full-bleed live 3D view, one floating control strip at the bottom. */
@@ -58,8 +58,6 @@
 <div class="loading" id="loading">Stitching the roundel…</div>
 <div class="bar">
   <div class="strip">
-    <span class="lbl" id="motion-lbl">Motion</span>
-    <div class="group" id="motions" role="group" aria-labelledby="motion-lbl"></div>
     <span class="lbl" id="mode-lbl">Drive</span>
     <div class="group" id="modes" role="group" aria-labelledby="mode-lbl"></div>
     <span class="lbl" id="look-lbl">Look</span>
@@ -73,9 +71,10 @@
 <script type="module">
 import { EmbroideryScene, LOOKS, MOTIONS } from '../src/renderer.js';
 
-const state = { look: 'window', motion: 'spring', mode: 'play' };
+const state = { look: 'window', mode: 'play' };
 const view = document.getElementById('view');
-const embroidery = new EmbroideryScene(view, { preset: LOOKS[state.look], motion: MOTIONS[state.motion] });
+// Spring & settle, with flourish loops. quality = sub-frames per frame for anti-aliasing and motion blur.
+const embroidery = new EmbroideryScene(view, { preset: LOOKS[state.look], motion: MOTIONS.spring, quality: +(new URLSearchParams(location.search).get('q') || 4) });
 
 const MODES = {
   play: { name: 'Autoplay', note: 'Stitches, holds, unpicks and repeats · drag to orbit' },
@@ -94,11 +93,10 @@ function buttons(el, items, key, onPick) {
 }
 const note = document.getElementById('note');
 function sync() {
-  for (const [id, key] of [['motions', 'motion'], ['modes', 'mode'], ['looks', 'look']])
+  for (const [id, key] of [['modes', 'mode'], ['looks', 'look']])
     document.getElementById(id).querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.key === state[key])));
   note.textContent = state.mode === 'manual' ? 'Drag the timeline to scrub' : MODES[state.mode].note;
 }
-buttons(document.getElementById('motions'), MOTIONS, 'motion', k => { embroidery.applyMotion(MOTIONS[k]); if (state.mode === 'play') embroidery.setProgress(0), embroidery.setMode('play'); });
 buttons(document.getElementById('modes'), MODES, 'mode', k => {
   if (k === 'play') embroidery.setProgress(0);
   if (k === 'scroll') embroidery.setProgress(0);

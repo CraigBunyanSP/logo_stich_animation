@@ -20,7 +20,7 @@ for (const t of ts.split(',').map(Number)) {
     }
   }, [t, !!close]);
   await page.waitForTimeout(+(process.env.WAIT||900));
-  await page.screenshot({ path: `${prefix}_${t}.png` });
+  await page.screenshot({ path: `${prefix}_${t}.png`, timeout: 240000 });
 }
 await browser.close();
 })();

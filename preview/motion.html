@@ -53,6 +53,10 @@
   .drop.on { opacity: 1; }
   .file-name { font-size: 12px; color: var(--muted); align-self: center; max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .note.error { color: #b3261e; }
+  .dye { align-items: center; gap: 10px; }
+  .dye label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+  .dye input[type=range] { width: 92px; accent-color: #1e1f23; }
+  .swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(0,0,0,.2); }
   @media (max-width: 520px) { .strip { grid-template-columns: 1fr; } .lbl { margin-top: 2px; } }
 </style>
 <script type="importmap">
@@ -71,6 +75,16 @@
     <div class="group" id="modes" role="group" aria-labelledby="mode-lbl"></div>
     <span class="lbl" id="look-lbl">Look</span>
     <div class="group" id="looks" role="group" aria-labelledby="look-lbl"></div>
+    <span class="lbl" id="cloth-lbl">Cloth</span>
+    <div class="group" id="cloths" role="group" aria-labelledby="cloth-lbl"></div>
+    <span class="lbl" id="dye-lbl">Cloth colour</span>
+    <div class="group dye" role="group" aria-labelledby="dye-lbl">
+      <label>Hue <input id="dye-h" type="range" min="0" max="360" step="1" value="350"></label>
+      <label>Colour <input id="dye-s" type="range" min="0" max="100" step="1" value="0"></label>
+      <label>Light <input id="dye-l" type="range" min="10" max="100" step="1" value="92"></label>
+      <span class="swatch" id="dye-swatch" aria-hidden="true"></span>
+      <button type="button" id="dye-reset">Reset</button>
+    </div>
     <span class="lbl" id="art-lbl">Artwork</span>
     <div class="group" id="art" role="group" aria-labelledby="art-lbl">
       <button type="button" data-art="sp">SP roundel</button>
@@ -86,9 +100,10 @@
 </div>
 
 <script type="module">
-import { EmbroideryScene, LOOKS, MOTIONS } from '../src/renderer.js';
+import { EmbroideryScene, LOOKS, MOTIONS, FABRICS } from '../src/renderer.js';
 
-const state = { look: 'window', mode: 'play' };
+const params = new URLSearchParams(location.search);
+const state = { look: params.get('look') || 'window', mode: 'play', cloth: params.get('fabric') || 'linen' };
 let lastCount = 0;
 const view = document.getElementById('view');
 // Spring & settle, with flourish loops. quality = sub-frames per frame for anti-aliasing and motion blur.
@@ -111,7 +126,7 @@ function buttons(el, items, key, onPick) {
 }
 const note = document.getElementById('note');
 function sync() {
-  for (const [id, key] of [['modes', 'mode'], ['looks', 'look']])
+  for (const [id, key] of [['modes', 'mode'], ['looks', 'look'], ['cloths', 'cloth']])
     document.getElementById(id).querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.key === state[key])));
   note.classList.remove('error');
   const count = typeof lastCount === 'number' && lastCount ? `${lastCount.toLocaleString()} stitches · ` : '';
@@ -125,6 +140,21 @@ buttons(document.getElementById('modes'), MODES, 'mode', k => {
 });
 const lookSubset = { window: LOOKS.window, studio: LOOKS.studio };
 buttons(document.getElementById('looks'), lookSubset, 'look', k => embroidery.applyLook(LOOKS[k]));
+const clothSubset = { canvas: FABRICS.canvas, linen: FABRICS.linen, natural: FABRICS.natural, procedural: FABRICS.procedural };
+buttons(document.getElementById('cloths'), clothSubset, 'cloth', k => embroidery.setFabric(k));
+const clothReady = embroidery.setFabric(state.cloth);
+
+// Cloth dye: hue / saturation / lightness. Saturation 0 keeps the look's own white or ecru cloth.
+const dye = { h: document.getElementById('dye-h'), s: document.getElementById('dye-s'), l: document.getElementById('dye-l') };
+const swatch = document.getElementById('dye-swatch');
+function applyDye() {
+  const css = `hsl(${dye.h.value}, ${dye.s.value}%, ${dye.l.value}%)`;
+  swatch.style.background = css;
+  embroidery.setFabricColour(+dye.s.value === 0 && +dye.l.value === 92 ? null : css);
+}
+for (const el of Object.values(dye)) el.addEventListener('input', applyDye);
+document.getElementById('dye-reset').addEventListener('click', () => { dye.h.value = 350; dye.s.value = 0; dye.l.value = 92; applyDye(); });
+applyDye();
 
 // Scroll mode: the wheel / a vertical swipe drives the timeline instead of the page.
 let scrollTarget = 0;
@@ -194,5 +224,6 @@ addEventListener('dragover', e => e.preventDefault());
 addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; drop.classList.remove('on'); useFile(e.dataTransfer.files[0]); });
 
 syncArt();
+await clothReady;
 await stitch(await (await fetch(ART.sp)).text(), 'the roundel'); window.__scene = embroidery; window.__stitchResult = true;
 </script>

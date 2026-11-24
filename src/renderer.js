@@ -52,6 +52,17 @@ export const LOOKS = {
 };
 
 
+// Scanned CC0 cloth (ambientCG / Poly Haven), stored in assets/fabric/<key>/.
+// Colour maps are pre-neutralised to a near-white albedo so the look's fabric colour tints them.
+// `threads` is roughly how many warp threads one tile holds; `scale` is tiles per world unit
+// (the logo is ~0.6 units wide), so threads * scale = threads per world unit.
+export const FABRICS = {
+  procedural: { name: 'Procedural weave' },
+  canvas: { name: 'Cotton canvas', path: 'fabric/canvas', scale: 1.0, normalScale: 1.6, ao: false },
+  linen: { name: 'Linen', path: 'fabric/linen', scale: 0.7, normalScale: 1.6, ao: true },
+  natural: { name: 'Natural linen', path: 'fabric/natural', scale: 0.45, normalScale: 2.0, ao: false },
+};
+
 const LOGO_SIZE = 0.72;    // world units across the stitch-engine frame (artwork fills ~84% of it)
 const ENGINE_RES = 512;    // stitch-engine raster size
 const RHO = 0.02;          // thread radius in the unit stitch geometry
@@ -171,6 +182,7 @@ export class EmbroideryScene {
       uGrowDur: { value: 0.01 }, uSettleDur: { value: 0.04 }, uDamp: { value: 4 }, uFreq: { value: 2 },
       uLoop: { value: 1 }, uSway: { value: 0.5 },
       uPopDur: { value: 0.025 }, uFlourishR: { value: 0.0018 },
+      uAoDirect: { value: 0 },
     };
     this.shutter = shutter;
     this.maxSamples = quality;
@@ -338,6 +350,23 @@ export class EmbroideryScene {
   //   await scene.setFabricMaps({ color, normal, roughness, ao, repeat: 6 });   // URLs; any can be omitted
   // `repeat` is tiles across one world unit (the logo is ~0.6 units wide).
   // Pass null to go back to the procedural weave.
+  // Dye the cloth: any CSS colour, or null to go back to the look's own cloth colour.
+  // The scanned maps are neutral, so the weave and highlights stay; only the dye changes.
+  setFabricColour(colour) {
+    this.fabricTint = colour == null ? null : new THREE.Color(colour);
+    this.#applyFabric();
+  }
+
+  // Pick one of FABRICS by key. `base` is the URL of the assets folder.
+  async setFabric(key, base = new URL('../assets/', import.meta.url).href) {
+    const f = FABRICS[key];
+    this.fabricKey = key;
+    if (!f || !f.path) return this.setFabricMaps(null);
+    const u = m => `${base}${f.path}/${m}.jpg`;
+    return this.setFabricMaps({ color: u('color'), normal: u('normal'), roughness: u('roughness'), ao: f.ao ? u('ao') : null,
+      repeat: f.scale, normalScale: f.normalScale });
+  }
+
   async setFabricMaps(maps) {
     if (!maps) { this.fabricMaps = null; this.#applyFabric(); return; }
     const loader = new THREE.TextureLoader();
@@ -348,7 +377,7 @@ export class EmbroideryScene {
       return t;
     }) : null;
     const [color, normal, roughness, ao] = await Promise.all([load(maps.color, true), load(maps.normal), load(maps.roughness), load(maps.ao)]);
-    this.fabricMaps = { color, normal, roughness, ao, repeat: maps.repeat ?? 6, normalScale: maps.normalScale ?? 1, tint: maps.tint ?? true };
+    this.fabricMaps = { color, normal, roughness, ao, repeat: maps.repeat ?? 6, normalScale: maps.normalScale ?? 1, tint: maps.tint ?? true, aoDirect: maps.aoDirect ?? 0.6 };
     this.#applyFabric();
   }
 
@@ -357,19 +386,25 @@ export class EmbroideryScene {
     if (F) {
       // The plane is 6 world units across.
       const rep = F.repeat * 6;
-      for (const t of [F.color, F.normal, F.roughness, F.ao]) if (t) t.repeat.set(rep, rep);
+      for (const t of [F.color, F.normal, F.roughness, F.ao]) if (t) {
+        // Keep threads square on non-square scans.
+        const aspect = t.image ? t.image.height / t.image.width : 1;
+        t.repeat.set(rep, rep / aspect);
+      }
       mat.map = F.color || null;
       // Keep the look's cloth colour as a tint, so both lighting looks still match their stills.
       mat.color.set(F.tint && F.color ? '#ffffff' : look.fabric);
       if (F.tint && F.color) mat.color.set(look.fabric).lerp(new THREE.Color('#ffffff'), 0.55);
+      if (this.fabricTint) mat.color.copy(this.fabricTint);
       mat.normalMap = F.normal || null;
       mat.normalScale.set(F.normalScale, F.normalScale);
       mat.roughnessMap = F.roughness || null;
       mat.roughness = F.roughness ? 1 : 0.9;
       mat.aoMap = F.ao || null;
       mat.aoMapIntensity = 1;
+      this.uniforms.uAoDirect.value = F.aoDirect;
     } else {
-      mat.color.set(look.fabric);
+      mat.color.set(this.fabricTint || look.fabric);
       mat.map = null; mat.aoMap = null;
       const { normal, roughness } = weaveTextures({ cells: look.weave.cells, slub: look.weave.slub });
       for (const tex of [normal, roughness]) tex.repeat.set(look.weave.repeat, look.weave.repeat);
@@ -478,6 +513,13 @@ export class EmbroideryScene {
     });
     this.fabricMat.onBeforeCompile = shader => {
       injectCloth(shader, this.uniforms);
+      // Three only lets AO darken ambient light; scanned cloth needs it in the key light's crevices too.
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform float uAoDirect;')
+        .replace('#include <aomap_fragment>', `#include <aomap_fragment>
+          #ifdef USE_AOMAP
+            reflectedLight.directDiffuse *= mix(1.0, ambientOcclusion, uAoDirect);
+          #endif`);
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', '#include <common>\nattribute float aPucker;\nattribute float aReveal;')
         .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>

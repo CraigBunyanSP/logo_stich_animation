@@ -43,6 +43,7 @@
   .progress { display: flex; align-items: center; gap: 8px; min-width: 0; }
   .progress input { flex: 1; min-width: 0; accent-color: var(--ink); }
   .note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .loading[hidden] { display: none; }
   .loading { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; pointer-events: none; }
   @media (max-width: 520px) { .strip { grid-template-columns: 1fr; } .lbl { margin-top: 2px; } }
 </style>

@@ -1,0 +1,289 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stitched Roundel</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+  /* Layout: full-bleed live 3D view, one floating control strip at the bottom. */
+  :root {
+    --bg: #e9eaec;
+    --panel: rgba(250, 250, 251, 0.86);
+    --ink: #1d1f23;
+    --muted: #5f646c;
+    --line: #cfd2d7;
+    --accent: #1d1f23;
+    --on-accent: #ffffff;
+    --font-ui: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #16171a; --panel: rgba(28, 30, 34, 0.86); --ink: #eceef1; --muted: #9aa0a8; --line: #3a3d44; --accent: #eceef1; --on-accent: #16171a; color-scheme: dark; }
+  }
+  :root[data-theme="dark"] { --bg: #16171a; --panel: rgba(28, 30, 34, 0.86); --ink: #eceef1; --muted: #9aa0a8; --line: #3a3d44; --accent: #eceef1; --on-accent: #16171a; color-scheme: dark; }
+  html, body { height: 100%; }
+  body { background: var(--bg); color: var(--ink); font-family: var(--font-ui); overflow: hidden; }
+  #view { position: fixed; inset: 0; }
+  #view canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  .bar {
+    position: fixed; left: 0; right: 0; bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: flex; justify-content: center; pointer-events: none;
+  }
+  .strip {
+    pointer-events: auto; width: 100%; max-width: 860px; box-sizing: border-box;
+    display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 8px 12px;
+    background: var(--panel); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px;
+  }
+  .lbl { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  .group { display: flex; gap: 6px; flex-wrap: wrap; }
+  .group button {
+    font: 500 13px/1 var(--font-ui); color: var(--ink); background: transparent;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; cursor: pointer;
+  }
+  .group button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  .progress { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .progress input { flex: 1; min-width: 0; accent-color: var(--ink); }
+  .note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .loading[hidden] { display: none; }
+  .loading { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; pointer-events: none; }
+  .drop {
+    position: fixed; inset: 12px; display: grid; place-items: center; pointer-events: none;
+    border: 2px dashed var(--ink); border-radius: 16px; background: color-mix(in srgb, var(--bg) 70%, transparent);
+    font: 500 15px/1.3 var(--font-ui); color: var(--ink); opacity: 0; transition: opacity .15s;
+  }
+  .drop.on { opacity: 1; }
+  .file-name { font-size: 12px; color: var(--muted); align-self: center; max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .note.error { color: #b3261e; }
+  .dye { align-items: center; gap: 10px; }
+  .hide-ui {
+    position: fixed; top: calc(12px + env(safe-area-inset-top, 0px)); right: max(16px, env(safe-area-inset-right, 0px)); z-index: 2;
+    font: 500 12px/1 var(--font-ui); color: var(--ink); background: var(--panel); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; cursor: pointer; transition: opacity .2s;
+  }
+  body.clean .bar { display: none; }
+  body.clean .hide-ui { opacity: 0.25; }
+  body.clean .hide-ui:hover, body.clean .hide-ui:focus-visible { opacity: 1; }
+  .focus-ring {
+    position: fixed; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%;
+    border: 1.5px solid rgba(255,255,255,.9); box-shadow: 0 0 0 1px rgba(0,0,0,.25); pointer-events: none; opacity: 0;
+  }
+  .focus-ring.on { animation: focus-pulse .7s ease-out; }
+  @keyframes focus-pulse { 0% { opacity: 1; transform: scale(1.6); } 60% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: scale(1); } }
+  .dye label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+  .dye input[type=range] { width: 92px; accent-color: #1e1f23; }
+  .swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(0,0,0,.2); }
+  @media (max-width: 520px) { .strip { grid-template-columns: 1fr; } .lbl { margin-top: 2px; } }
+</style>
+<script>
+// Classic (non-module) script, so it also reports a module that fails to load or link.
+window.showProblem = function (msg) {
+  var el = document.getElementById('loading');
+  if (!el) return;
+  el.hidden = false; el.style.color = '#b3261e'; el.style.padding = '24px'; el.style.textAlign = 'center';
+  el.textContent = 'Something went wrong: ' + msg;
+};
+addEventListener('error', function (e) {
+  if (e.target && e.target !== window) {
+    if (e.target.tagName === 'SCRIPT') window.showProblem('a script failed to load (' + (e.target.src || 'inline') + ').');
+    return; // other resources (images etc.) report through their own code
+  }
+  window.showProblem(e.message || String(e.error));
+}, true);
+addEventListener('unhandledrejection', function (e) { window.showProblem((e.reason && e.reason.message) || String(e.reason)); });
+</script>
+<script type="importmap">
+{ "imports": {
+  "three": "../node_modules/three/build/three.module.js",
+  "three/addons/": "../node_modules/three/examples/jsm/"
+} }
+</script>
+
+<div id="view"></div>
+<div class="loading" id="loading">Stitching the roundel…</div>
+<div class="drop" id="drop" aria-hidden="true">Drop an SVG to stitch it</div>
+<button type="button" class="hide-ui" id="hide-ui" aria-pressed="false" title="Hide controls (H)">Hide controls</button>
+<div class="focus-ring" id="focus-ring" aria-hidden="true"></div>
+<div class="bar" id="bar">
+  <div class="strip">
+    <span class="lbl" id="mode-lbl">Drive</span>
+    <div class="group" id="modes" role="group" aria-labelledby="mode-lbl"></div>
+    <span class="lbl" id="look-lbl">Look</span>
+    <div class="group" id="looks" role="group" aria-labelledby="look-lbl"></div>
+    <span class="lbl" id="cloth-lbl">Cloth</span>
+    <div class="group" id="cloths" role="group" aria-labelledby="cloth-lbl"></div>
+    <span class="lbl" id="dye-lbl">Cloth colour</span>
+    <div class="group dye" role="group" aria-labelledby="dye-lbl">
+      <label>Hue <input id="dye-h" type="range" min="0" max="360" step="1" value="350"></label>
+      <label>Colour <input id="dye-s" type="range" min="0" max="100" step="1" value="0"></label>
+      <label>Light <input id="dye-l" type="range" min="10" max="100" step="1" value="92"></label>
+      <span class="swatch" id="dye-swatch" aria-hidden="true"></span>
+      <button type="button" id="dye-reset">Reset</button>
+    </div>
+    <span class="lbl" id="art-lbl">Artwork</span>
+    <div class="group" id="art" role="group" aria-labelledby="art-lbl">
+      <button type="button" data-art="sp">SP roundel</button>
+      <button type="button" data-art="multi">Multicolour test</button>
+      <button type="button" id="upload">Upload SVG…</button>
+      <span class="file-name" id="file-name"></span>
+      <input type="file" id="file" accept=".svg,image/svg+xml,image/png,image/jpeg,image/webp" hidden>
+    </div>
+    <label class="lbl" for="progress">Timeline</label>
+    <div class="progress"><input id="progress" type="range" min="0" max="1" step="0.001" value="0"></div>
+    <div class="note" id="note"></div>
+  </div>
+</div>
+
+<script type="module">
+import { EmbroideryScene, LOOKS, MOTIONS, FABRICS } from '../src/renderer.js';
+
+const params = new URLSearchParams(location.search);
+const state = { look: params.get('look') || 'window', mode: 'play', cloth: params.get('fabric') || 'linen' };
+let lastCount = 0;
+const view = document.getElementById('view');
+let embroidery;
+try {
+  // Spring & settle. quality = sub-frames per frame for anti-aliasing and motion blur.
+  embroidery = new EmbroideryScene(view, { preset: LOOKS[state.look], motion: MOTIONS.spring, quality: +(new URLSearchParams(location.search).get('q') || 4) });
+} catch (err) {
+  window.showProblem(`3D could not start in this browser (${err.message}). Check that WebGL / hardware acceleration is turned on.`);
+  throw err;
+}
+embroidery.renderer.debug.onShaderError = (gl, program, vs, fs) => {
+  const log = (gl.getShaderInfoLog(vs) || '') + (gl.getShaderInfoLog(fs) || '') + (gl.getProgramInfoLog(program) || '');
+  window.showProblem('a shader failed to compile in this browser. ' + log.trim().split('\n').slice(0, 3).join(' '));
+};
+
+const MODES = {
+  play: { name: 'Autoplay', note: 'Stitches, holds, unpicks and repeats · drag to orbit' },
+  scroll: { name: 'Scroll', note: 'Scroll or swipe over the cloth to stitch forwards and back' },
+  hover: { name: 'Hover', note: 'Move the pointer over the finished piece: the thread loosens and the cloth gives' },
+};
+
+function buttons(el, items, key, onPick) {
+  el.replaceChildren();
+  for (const [k, item] of Object.entries(items)) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.textContent = item.name; b.dataset.key = k;
+    b.addEventListener('click', () => { state[key] = k; onPick(k); sync(); });
+    el.appendChild(b);
+  }
+}
+const note = document.getElementById('note');
+function sync() {
+  for (const [id, key] of [['modes', 'mode'], ['looks', 'look'], ['cloths', 'cloth']])
+    document.getElementById(id).querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.key === state[key])));
+  note.classList.remove('error');
+  const count = typeof lastCount === 'number' && lastCount ? `${lastCount.toLocaleString()} stitches · ` : '';
+  note.textContent = count + (state.mode === 'manual' ? 'Drag the timeline to scrub' : MODES[state.mode].note) + ' · click to focus, double-click to reset · H hides controls';
+}
+buttons(document.getElementById('modes'), MODES, 'mode', k => {
+  if (k === 'play') embroidery.setProgress(0);
+  if (k === 'scroll') embroidery.setProgress(0);
+  if (k === 'hover') embroidery.setProgress(1);
+  embroidery.setMode(k);
+});
+const lookSubset = { window: LOOKS.window, studio: LOOKS.studio };
+buttons(document.getElementById('looks'), lookSubset, 'look', k => embroidery.applyLook(LOOKS[k]));
+const clothSubset = { canvas: FABRICS.canvas, linen: FABRICS.linen, natural: FABRICS.natural, procedural: FABRICS.procedural };
+buttons(document.getElementById('cloths'), clothSubset, 'cloth', k => embroidery.setFabric(k));
+const clothReady = embroidery.setFabric(state.cloth);
+
+// Cloth dye: hue / saturation / lightness. Saturation 0 keeps the look's own white or ecru cloth.
+const dye = { h: document.getElementById('dye-h'), s: document.getElementById('dye-s'), l: document.getElementById('dye-l') };
+const swatch = document.getElementById('dye-swatch');
+function applyDye() {
+  const css = `hsl(${dye.h.value}, ${dye.s.value}%, ${dye.l.value}%)`;
+  swatch.style.background = css;
+  embroidery.setFabricColour(+dye.s.value === 0 && +dye.l.value === 92 ? null : css);
+}
+for (const el of Object.values(dye)) el.addEventListener('input', applyDye);
+document.getElementById('dye-reset').addEventListener('click', () => { dye.h.value = 350; dye.s.value = 0; dye.l.value = 92; applyDye(); });
+applyDye();
+
+// Scroll mode: the wheel / a vertical swipe drives the timeline instead of the page.
+let scrollTarget = 0;
+view.addEventListener('wheel', e => {
+  if (state.mode !== 'scroll') return;
+  e.preventDefault();
+  scrollTarget = Math.min(1, Math.max(0, embroidery.target + e.deltaY * 0.0005));
+  embroidery.scrubTo(scrollTarget);
+}, { passive: false });
+let touchY = null;
+view.addEventListener('pointerdown', e => { if (state.mode === 'scroll') touchY = e.clientY; });
+view.addEventListener('pointermove', e => {
+  if (state.mode !== 'scroll' || touchY === null) return;
+  embroidery.scrubTo(embroidery.target + (touchY - e.clientY) * 0.0025);
+  touchY = e.clientY;
+});
+addEventListener('pointerup', () => { touchY = null; });
+
+const slider = document.getElementById('progress');
+let dragging = false;
+slider.addEventListener('pointerdown', () => { dragging = true; });
+addEventListener('pointerup', () => { dragging = false; });
+slider.addEventListener('input', () => { state.mode = 'manual'; embroidery.setProgress(+slider.value); sync(); });
+(function tick() { if (!dragging) slider.value = embroidery.progress; requestAnimationFrame(tick); })();
+
+// ---------- artwork: built-in examples, file picker, drag and drop ----------
+const loading = document.getElementById('loading'), fileName = document.getElementById('file-name');
+const ART = { sp: '../assets/sp-roundel.svg', multi: '../assets/test-multicolour.svg' };
+let artKey = 'sp', busy = false;
+function syncArt() { document.querySelectorAll('[data-art]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.art === artKey))); }
+async function stitch(input, label) {
+  if (busy) return;
+  busy = true;
+  loading.textContent = `Stitching ${label}…`; loading.hidden = false;
+  try {
+    const result = await embroidery.setSVG(input);
+    lastCount = result.count;
+    if (state.mode === 'hover') embroidery.setProgress(1); else embroidery.setProgress(0);
+    embroidery.setMode(state.mode === 'manual' ? 'play' : state.mode);
+    if (state.mode === 'manual') state.mode = 'play';
+    note.classList.remove('error');
+    sync();
+  } catch (err) {
+    note.classList.add('error');
+    note.textContent = `Couldn't stitch ${label}: ${err.message}`;
+  } finally {
+    loading.hidden = true; busy = false;
+  }
+}
+document.querySelectorAll('[data-art]').forEach(b => b.addEventListener('click', async () => {
+  artKey = b.dataset.art; fileName.textContent = ''; syncArt();
+  stitch(await (await fetch(ART[artKey])).text(), b.textContent);
+}));
+const fileInput = document.getElementById('file');
+document.getElementById('upload').addEventListener('click', () => fileInput.click());
+function useFile(file) {
+  if (!file) return;
+  artKey = 'file'; syncArt(); fileName.textContent = file.name;
+  stitch(file, file.name);
+}
+fileInput.addEventListener('change', () => { useFile(fileInput.files[0]); fileInput.value = ''; });
+const drop = document.getElementById('drop');
+let dragDepth = 0;
+addEventListener('dragenter', e => { if (e.dataTransfer?.types.includes('Files')) { dragDepth++; drop.classList.add('on'); } });
+addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; drop.classList.remove('on'); } });
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => { e.preventDefault(); dragDepth = 0; drop.classList.remove('on'); useFile(e.dataTransfer.files[0]); });
+
+// Click to focus: show a brief ring where focus was pulled.
+const ring = document.getElementById('focus-ring');
+view.addEventListener('focuspoint', e => {
+  ring.style.left = e.detail.x + 'px'; ring.style.top = e.detail.y + 'px';
+  ring.classList.remove('on'); void ring.offsetWidth; ring.classList.add('on');
+});
+
+// Hide / show the control panel (button or H key).
+const hideBtn = document.getElementById('hide-ui');
+function setClean(on) {
+  document.body.classList.toggle('clean', on);
+  hideBtn.textContent = on ? 'Show controls' : 'Hide controls';
+  hideBtn.setAttribute('aria-pressed', String(on));
+}
+hideBtn.addEventListener('click', () => setClean(!document.body.classList.contains('clean')));
+addEventListener('keydown', e => { if ((e.key === 'h' || e.key === 'H') && !e.target.closest('input, textarea')) setClean(!document.body.classList.contains('clean')); });
+
+syncArt();
+await clothReady;
+await stitch(await (await fetch(ART.sp)).text(), 'the roundel'); window.__scene = embroidery; window.__stitchResult = true;
+</script>

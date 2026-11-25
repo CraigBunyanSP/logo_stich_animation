@@ -32,11 +32,12 @@
   <div id="stats">Loading…</div>
 </div>
 <script type="module">
-import { EmbroideryScene, LOOKS } from '../src/renderer.js';
+import { EmbroideryScene, LOOKS, MOTIONS } from '../src/renderer.js';
 
 const params = new URLSearchParams(location.search);
-const lookKey = params.get('look') || 'studio';
-const embroidery = new EmbroideryScene(document.getElementById('view'), { preset: LOOKS[lookKey] });
+const lookKey = params.get('look') || 'window';
+const embroidery = new EmbroideryScene(document.getElementById('view'), { preset: LOOKS[lookKey], motion: MOTIONS[params.get('motion') || 'spring'], quality: +(params.get('q') || 4) });
+window.__scene = embroidery;
 const stats = document.getElementById('stats');
 const looksEl = document.getElementById('looks');
 for (const [key, look] of Object.entries(LOOKS)) {
@@ -59,6 +60,7 @@ document.getElementById('file').onchange = async e => { const f = e.target.files
 if (params.has('t')) { slider.value = params.get('t'); }
 await load(await (await fetch(params.get('svg') || '../assets/sp-roundel.svg')).text());
 embroidery.setProgress(+slider.value);
+if (params.has('mode')) embroidery.setMode(params.get('mode'));
 if (params.has('hideui')) document.querySelector('.ui').style.display = 'none';
 </script>
 </body>

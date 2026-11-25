@@ -6,6 +6,10 @@
   "description": "Code-based embroidery simulation that stitches any SVG logo into life.",
   "scripts": {
     "serve": "python3 -m http.server 8765",
-    "shot": "node scripts/shot.cjs"
+    "shot": "node scripts/shot.cjs",
+    "build": "node scripts/build-web.cjs"
+  },
+  "dependencies": {
+    "three": "^0.170.0"
   }
 }

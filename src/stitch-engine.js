@@ -24,9 +24,10 @@ const DEFAULTS = {
   colourTolerance: 48,    // RGB distance for grouping fills into layers
 };
 
-export async function svgToStitches(svgText, options = {}) {
+// `input` is SVG text, or a File / Blob (SVG, PNG, JPEG or WebP).
+export async function svgToStitches(input, options = {}) {
   const o = { ...DEFAULTS, ...options };
-  const { data, size } = await rasterise(svgText, o);
+  const { data, size } = await rasterise(input, o);
   const layers = splitLayers(data, size, o);
   const out = { size, layers: [] };
   for (const layer of layers) {
@@ -46,27 +47,100 @@ export async function svgToStitches(svgText, options = {}) {
 
 // ---------- 1. rasterise ----------
 
-async function rasterise(svgText, o) {
+// Accepts SVG text, or a File / Blob (SVG, PNG, JPEG, WebP).
+async function rasterise(input, o) {
   const size = o.resolution;
-  const blob = new Blob([svgText], { type: 'image/svg+xml' });
-  const url = URL.createObjectURL(blob);
+  const isSVG = typeof input === 'string' || input.type === 'image/svg+xml' || /\.svg$/i.test(input.name || '');
+  const img = isSVG
+    ? await loadSVGImage(prepareSVG(typeof input === 'string' ? input : await input.text()))
+    : await createImageBitmap(input).catch(() => { throw new Error('This file could not be read as an image.'); });
   try {
-    const img = new Image();
-    img.decoding = 'async';
-    img.src = url;
-    await img.decode();
-    const w = img.naturalWidth || 1024, h = img.naturalHeight || 1024;
+    const w = img.naturalWidth || img.width || 1024, h = img.naturalHeight || img.height || 1024;
     const inner = size * (1 - 2 * o.padding);
     const scale = inner / Math.max(w, h);
     const canvas = document.createElement('canvas');
     canvas.width = canvas.height = size;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    ctx.clearRect(0, 0, size, size);
-    ctx.drawImage(img, (size - w * scale) / 2, (size - h * scale) / 2, w * scale, h * scale);
-    return { data: ctx.getImageData(0, 0, size, size).data, size };
+    const draw = (sc, x0, y0) => {
+      ctx.clearRect(0, 0, size, size);
+      ctx.drawImage(img, x0, y0, w * sc, h * sc);
+      let imageData;
+      try { imageData = ctx.getImageData(0, 0, size, size); }
+      catch { throw new Error('The browser would not let the page read this image.'); }
+      removeBackground(imageData.data, size, Math.round(x0), Math.round(y0), Math.round(w * sc), Math.round(h * sc));
+      return imageData;
+    };
+    let imageData = draw(scale, (size - w * scale) / 2, (size - h * scale) / 2);
+    // Logos with lots of empty space in their viewBox: redraw so the artwork itself fills the frame.
+    const box = artworkBounds(imageData.data, size);
+    if (!box) throw new Error('No shapes were found in this file.');
+    const span = Math.max(box.w, box.h);
+    if (span < inner * 0.97) {
+      const k = inner / span, sc = scale * k;
+      const cx = box.x + box.w / 2, cy = box.y + box.h / 2;            // artwork centre in raster px
+      const x0 = (size - w * scale) / 2, y0 = (size - h * scale) / 2;
+      imageData = draw(sc, size / 2 - (cx - x0) * k, size / 2 - (cy - y0) * k);
+    }
+    return { data: imageData.data, size };
   } finally {
-    URL.revokeObjectURL(url);
+    img.close?.();
   }
+}
+
+// SVG goes in as a data: URL, not a blob: URL. Firefox treats blob: URLs made inside a
+// sandboxed frame (as on an embed or an artifact page) as another origin, which locks
+// the canvas against reading pixels back. Waits on load rather than decode(), which
+// Firefox does not always resolve for SVG.
+function loadSVGImage(svgText) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('This SVG could not be drawn. It may use features browsers do not support in images, such as external fonts or linked files.'));
+    img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgText);
+  });
+}
+
+// Make SVG text safe to rasterise: needs an xmlns, and an explicit size that
+// keeps the viewBox's aspect (browsers otherwise fall back to 300 x 150).
+function prepareSVG(text) {
+  const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+  const svg = doc.documentElement;
+  if (!svg || svg.nodeName.toLowerCase() !== 'svg' || doc.querySelector('parsererror')) throw new Error('This doesn\'t look like a valid SVG file.');
+  svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  const vb = (svg.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
+  let w = parseFloat(svg.getAttribute('width')), h = parseFloat(svg.getAttribute('height'));
+  const pct = /%/.test(svg.getAttribute('width') || '') || /%/.test(svg.getAttribute('height') || '');
+  if (vb.length === 4 && vb[2] > 0 && vb[3] > 0 && (!(w > 0) || !(h > 0) || pct)) { w = vb[2]; h = vb[3]; }
+  if (!(w > 0) || !(h > 0)) { w = 1024; h = 1024; }
+  // Rasterise large so thin details survive.
+  const k = 2048 / Math.max(w, h);
+  svg.setAttribute('width', String(w * k));
+  svg.setAttribute('height', String(h * k));
+  if (vb.length !== 4) svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  return new XMLSerializer().serializeToString(svg);
+}
+
+// A solid background (a full-bleed rect, or a JPEG's paper colour) would be
+// stitched as one huge block. If the four corners of the artwork share one
+// opaque colour, treat that colour as the background and clear it.
+function removeBackground(d, size, x0, y0, w, h) {
+  const at = (x, y) => (Math.min(size - 1, Math.max(0, y)) * size + Math.min(size - 1, Math.max(0, x))) * 4;
+  const corners = [at(x0 + 1, y0 + 1), at(x0 + w - 2, y0 + 1), at(x0 + 1, y0 + h - 2), at(x0 + w - 2, y0 + h - 2)];
+  if (corners.some(i => d[i + 3] < 200)) return;
+  const [r, g, b] = [d[corners[0]], d[corners[0] + 1], d[corners[0] + 2]];
+  const same = i => d[i + 3] > 0 && Math.abs(d[i] - r) + Math.abs(d[i + 1] - g) + Math.abs(d[i + 2] - b) < 60;
+  if (!corners.every(same)) return;
+  // Clear every pixel of the background colour, including holes it shows through
+  // (letter counters, the inside of a ring), which would otherwise be stitched.
+  for (let i = 0; i < d.length; i += 4) if (same(i)) d[i + 3] = 0;
+}
+
+function artworkBounds(d, size) {
+  let minX = size, minY = size, maxX = -1, maxY = -1;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    if (d[(y * size + x) * 4 + 3] > 40) { if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y; }
+  }
+  return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
 }
 
 // ---------- 2. colour layers ----------

@@ -50,28 +50,23 @@ export async function svgToStitches(input, options = {}) {
 // Accepts SVG text, or a File / Blob (SVG, PNG, JPEG, WebP).
 async function rasterise(input, o) {
   const size = o.resolution;
-  const blob = typeof input === 'string'
-    ? new Blob([prepareSVG(input)], { type: 'image/svg+xml' })
-    : input.type === 'image/svg+xml' || /\.svg$/i.test(input.name || '')
-      ? new Blob([prepareSVG(await input.text())], { type: 'image/svg+xml' })
-      : input;
-  const url = URL.createObjectURL(blob);
+  const isSVG = typeof input === 'string' || input.type === 'image/svg+xml' || /\.svg$/i.test(input.name || '');
+  const img = isSVG
+    ? await loadSVGImage(prepareSVG(typeof input === 'string' ? input : await input.text()))
+    : await createImageBitmap(input).catch(() => { throw new Error('This file could not be read as an image.'); });
   try {
-    const img = new Image();
-    img.decoding = 'async';
-    img.src = url;
-    try { await img.decode(); } catch { throw new Error('This file could not be read as an image.'); }
-    const w = img.naturalWidth || 1024, h = img.naturalHeight || 1024;
+    const w = img.naturalWidth || img.width || 1024, h = img.naturalHeight || img.height || 1024;
     const inner = size * (1 - 2 * o.padding);
     const scale = inner / Math.max(w, h);
     const canvas = document.createElement('canvas');
     canvas.width = canvas.height = size;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    ctx.clearRect(0, 0, size, size);
     const draw = (sc, x0, y0) => {
       ctx.clearRect(0, 0, size, size);
       ctx.drawImage(img, x0, y0, w * sc, h * sc);
-      const imageData = ctx.getImageData(0, 0, size, size);
+      let imageData;
+      try { imageData = ctx.getImageData(0, 0, size, size); }
+      catch { throw new Error('The browser would not let the page read this image.'); }
       removeBackground(imageData.data, size, Math.round(x0), Math.round(y0), Math.round(w * sc), Math.round(h * sc));
       return imageData;
     };
@@ -88,8 +83,21 @@ async function rasterise(input, o) {
     }
     return { data: imageData.data, size };
   } finally {
-    URL.revokeObjectURL(url);
+    img.close?.();
   }
+}
+
+// SVG goes in as a data: URL, not a blob: URL. Firefox treats blob: URLs made inside a
+// sandboxed frame (as on an embed or an artifact page) as another origin, which locks
+// the canvas against reading pixels back. Waits on load rather than decode(), which
+// Firefox does not always resolve for SVG.
+function loadSVGImage(svgText) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('This SVG could not be drawn. It may use features browsers do not support in images, such as external fonts or linked files.'));
+    img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgText);
+  });
 }
 
 // Make SVG text safe to rasterise: needs an xmlns, and an explicit size that

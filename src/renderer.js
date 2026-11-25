@@ -221,8 +221,12 @@ export class EmbroideryScene {
     this.#buildThreadMesh();
     this.#buildFlourish();
 
-    this.composer = new EffectComposer(renderer);
+    // Half-float targets need a colour-buffer extension; fall back to 8-bit where a browser / GPU lacks it.
+    const floatOK = renderer.extensions.has('EXT_color_buffer_float') || renderer.extensions.has('EXT_color_buffer_half_float');
+    const targetType = floatOK ? THREE.HalfFloatType : THREE.UnsignedByteType;
+    this.composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: targetType }));
     this.accumulate = new AccumulatePass(this.scene, this.camera, {
+      type: targetType,
       samples: quality,
       setSubframe: f => {
         // f = 0 is the start of the shutter, 1 is this frame.

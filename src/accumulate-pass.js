@@ -13,13 +13,13 @@ const JITTER = Array.from({ length: 16 }, (_, i) => [halton(i + 1, 2) - 0.5, hal
 
 export class AccumulatePass extends Pass {
   // setSubframe(fraction) is called before each sub-frame: 0 = start of the shutter, 1 = now.
-  constructor(scene, camera, { samples = 4, msaa = 4, setSubframe = () => {} } = {}) {
+  constructor(scene, camera, { samples = 4, msaa = 4, type = THREE.HalfFloatType, setSubframe = () => {} } = {}) {
     super();
     this.scene = scene; this.camera = camera;
     this.samples = samples;
     this.setSubframe = setSubframe;
     this.needsSwap = false;
-    this.sampleTarget = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: msaa });
+    this.sampleTarget = new THREE.WebGLRenderTarget(1, 1, { type, samples: msaa });
     this.copy = new THREE.ShaderMaterial({
       uniforms: THREE.UniformsUtils.clone(CopyShader.uniforms),
       vertexShader: CopyShader.vertexShader, fragmentShader: CopyShader.fragmentShader,

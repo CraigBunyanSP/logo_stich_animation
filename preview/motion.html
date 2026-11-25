@@ -73,6 +73,23 @@
   .swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid rgba(0,0,0,.2); }
   @media (max-width: 520px) { .strip { grid-template-columns: 1fr; } .lbl { margin-top: 2px; } }
 </style>
+<script>
+// Classic (non-module) script, so it also reports a module that fails to load or link.
+window.showProblem = function (msg) {
+  var el = document.getElementById('loading');
+  if (!el) return;
+  el.hidden = false; el.style.color = '#b3261e'; el.style.padding = '24px'; el.style.textAlign = 'center';
+  el.textContent = 'Something went wrong: ' + msg;
+};
+addEventListener('error', function (e) {
+  if (e.target && e.target !== window) {
+    if (e.target.tagName === 'SCRIPT') window.showProblem('a script failed to load (' + (e.target.src || 'inline') + ').');
+    return; // other resources (images etc.) report through their own code
+  }
+  window.showProblem(e.message || String(e.error));
+}, true);
+addEventListener('unhandledrejection', function (e) { window.showProblem((e.reason && e.reason.message) || String(e.reason)); });
+</script>
 <script type="importmap">
 { "imports": {
   "three": "../node_modules/three/build/three.module.js",
@@ -122,25 +139,17 @@ const params = new URLSearchParams(location.search);
 const state = { look: params.get('look') || 'window', mode: 'play', cloth: params.get('fabric') || 'linen' };
 let lastCount = 0;
 const view = document.getElementById('view');
-// Anything that goes wrong is shown on the page, so a browser-specific problem can be reported.
-function showProblem(msg) {
-  const el = document.getElementById('loading');
-  el.hidden = false; el.style.color = '#b3261e'; el.style.padding = '24px'; el.style.textAlign = 'center';
-  el.textContent = `Something went wrong: ${msg}`;
-}
-addEventListener('error', e => showProblem(e.message || String(e.error)));
-addEventListener('unhandledrejection', e => showProblem(e.reason?.message || String(e.reason)));
 let embroidery;
 try {
   // Spring & settle. quality = sub-frames per frame for anti-aliasing and motion blur.
   embroidery = new EmbroideryScene(view, { preset: LOOKS[state.look], motion: MOTIONS.spring, quality: +(new URLSearchParams(location.search).get('q') || 4) });
 } catch (err) {
-  showProblem(`3D could not start in this browser (${err.message}). Check that WebGL / hardware acceleration is turned on.`);
+  window.showProblem(`3D could not start in this browser (${err.message}). Check that WebGL / hardware acceleration is turned on.`);
   throw err;
 }
 embroidery.renderer.debug.onShaderError = (gl, program, vs, fs) => {
   const log = (gl.getShaderInfoLog(vs) || '') + (gl.getShaderInfoLog(fs) || '') + (gl.getProgramInfoLog(program) || '');
-  showProblem('a shader failed to compile in this browser. ' + log.trim().split('\n').slice(0, 3).join(' '));
+  window.showProblem('a shader failed to compile in this browser. ' + log.trim().split('\n').slice(0, 3).join(' '));
 };
 
 const MODES = {
